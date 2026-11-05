@@ -66,6 +66,8 @@ struct FlowParams {
     float regularization = 2e-4f;  // Stabilisiert flaechige Bereiche
     int   smoothRadius   = 2;      // Glaettung des Endergebnisses
     float guideRadius    = 40.f;   // Einflussradius der Track Points (px, Fluss-Aufloesung)
+    float initU          = 0.f;    // Startwert der Bewegung (globale Verschiebung, px von I0)
+    float initV          = 0.f;
 };
 
 // Art der Unschaerfe
@@ -98,6 +100,17 @@ void LumaFromRGBA(const RGBAImage& src, int factor, Image& dst, float alphaWeigh
 // Mischt die Track Points in ein Vektorfeld ein. 'scale' rechnet die
 // Guide-Koordinaten in die Aufloesung des Felds um.
 void ApplyGuides(Flow& f, const std::vector<Guide>& guides, float radius, float scale);
+
+// Grobe globale Verschiebung von I0 nach I1 (Suche auf stark verkleinertem Bild).
+// Dient als Startwert fuer ComputeFlow, damit auch sehr grosse Bewegungen
+// (Speed Ramps) gefunden werden. Ergebnis in Pixeln von I0.
+void EstimateGlobalShift(const Image& I0, const Image& I1, float& dx, float& dy);
+
+// Kameramodell: Bei Kamerabewegung (Drohne, Schwenk, Fahrt) folgt die Bewegung
+// im ganzen Bild einer perspektivischen Abbildung (Homographie). Diese wird
+// robust (RANSAC) aus den verlaesslichen Vektoren geschaetzt und ersetzt das
+// Vektorfeld. Gibt false zurueck, wenn kein Modell passt (dann unveraendert).
+bool FitCameraModel(const Image& I0, Flow* fwd, Flow* bwd);
 
 // Dichter Fluss von I0 nach I1: I0(x) ~ I1(x + flow(x)).
 void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& out,

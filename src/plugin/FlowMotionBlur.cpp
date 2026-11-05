@@ -277,6 +277,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_SLIDER("Max Samples", 3, 256, 3, 64, 32, MAX_SAMPLES_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Bewegungsart", 2, MOTION_CAMERA,
+                 "Kamera (Drohne, Schwenk, Fahrt)|Frei (bewegte Objekte)", MOTION_TYPE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Unschaerfe-Modus", 2, MODE_NATURAL,
                  "Natuerlich (Kamera)|Objekte (Vordergrund verschmiert)", BLUR_MODE_DISK_ID);
 
@@ -456,6 +460,7 @@ struct NbInfo {
     std::string status = "NICHT ABGEFRAGT";
     double diff = 0;    // mittlerer Helligkeitsunterschied zum aktuellen Bild
     double motion = 0;  // mittlere erkannte Bewegung in Pixeln
+    double shift = 0;   // Ergebnis der groben Vorsuche in Pixeln
 };
 
 static std::string Num(double v, int prec = 1)
@@ -539,7 +544,11 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
                 double d = 0;
                 for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
                 info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
-                eng.Flow(curLuma, nbLuma, fp, guides.empty() ? nullptr : &guides, flow);
+                // Grobe Vorsuche: findet auch sehr grosse Bewegungen (Speed Ramps)
+                fmb::FlowParams fp2 = fp;
+                fmb::EstimateGlobalShift(curLuma, nbLuma, fp2.initU, fp2.initV);
+                info.shift = std::hypot(fp2.initU, fp2.initV) * factor;
+                eng.Flow(curLuma, nbLuma, fp2, guides.empty() ? nullptr : &guides, flow);
                 double m = 0;
                 for (size_t i = 0; i < flow.u.d.size(); ++i) m += std::hypot(flow.u.d[i], flow.v.d[i]);
                 info.motion = flow.u.d.empty() ? 0 : m / flow.u.d.size() * factor;
@@ -624,18 +633,39 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         const std::vector<fmb::Guide> gF = CollectGuides(in_data, params, +step, factor);
         const std::vector<fmb::Guide> gB = CollectGuides(in_data, params, -step, factor);
 
+        // Im Kamera-Modus werden Track Points erst nach dem Modell angewendet,
+        // sonst verzerren sie die Schaetzung der Kamerabewegung.
+        const bool cameraMode = params[FMB_MOTION_TYPE]->u.pd.value != MOTION_FREE;
+        const std::vector<fmb::Guide> noGuides;
+        const std::vector<fmb::Guide>& gFtrack = cameraMode ? noGuides : gF;
+        const std::vector<fmb::Guide>& gBtrack = cameraMode ? noGuides : gB;
+
         fmb::Flow fwd, bwd;
         NbInfo infoF, infoB;
-        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gF, eng, fwd, err, infoF);
+        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, infoF);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
-        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gB, eng, bwd, err, infoB);
+        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, infoB);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
-        // Unsichere Vektoren (glatte Flaechen, widerspruechliche Richtungen)
-        // durch die Bewegung der verlaesslichen Umgebung ersetzen.
-        fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
+        // Kamera-Modell: eine perspektivische Bewegung fuer das ganze Bild
+        // (glatt, flackerfrei). Sonst / falls kein Modell passt: unsichere
+        // Vektoren aus der verlaesslichen Umgebung auffuellen.
+        const char* modelState = "AUS (FREI)";
+        if (cameraMode) {
+            if (fmb::FitCameraModel(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr))
+                modelState = "OK";
+            else {
+                modelState = "NICHT GEFUNDEN -> FREI";
+                fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
+            }
+            // Track Points zuletzt anwenden
+            if (haveF && !gF.empty()) fmb::ApplyGuides(fwd, gF, fp.guideRadius, 1.f);
+            if (haveB && !gB.empty()) fmb::ApplyGuides(bwd, gB, fp.guideRadius, 1.f);
+        } else {
+            fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
+        }
 
         if (view == VIEW_VECTORS) {
             const fmb::Flow& show = haveF ? fwd : bwd;
@@ -654,10 +684,11 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("TIME_STEP: " + std::to_string(in_data->time_step) + "  LOCAL: " + std::to_string(in_data->local_time_step));
             L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")");
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
+            L.push_back(std::string("KAMERA-MODELL: ") + modelState);
             L.push_back("VORWAERTS: " + infoF.status);
-            L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
+            L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
             L.push_back("RUECKWAERTS: " + infoB.status);
-            L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
+            L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  VORSUCHE " + Num(infoB.shift) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
             L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
             diag::DrawLines(result, L);
         }

@@ -271,10 +271,13 @@ void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& ou
                         init.v.row(y)[x] = Sample(cur.v, cx, cy) * kv;
                     }
             });
-        } else if (guides) {
-            // Track Points geben der groebsten Stufe einen Startwert,
-            // damit auch grosse Bewegungen gefunden werden.
-            ApplyGuides(init, *guides, p.guideRadius, static_cast<float>(w) / I0.w);
+        } else {
+            // Groebste Stufe: globale Verschiebung als Startwert
+            const float ls = static_cast<float>(w) / I0.w;
+            std::fill(init.u.d.begin(), init.u.d.end(), p.initU * ls);
+            std::fill(init.v.d.begin(), init.v.d.end(), p.initV * ls);
+            // Track Points geben zusaetzlich lokale Startwerte
+            if (guides) ApplyGuides(init, *guides, p.guideRadius, ls);
         }
         cur = std::move(init);
 
@@ -361,45 +364,36 @@ void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& ou
 // Verlaesslichkeit + Auffuellen unsicherer Vektoren
 // ---------------------------------------------------------------------------
 
-void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd)
+// Verlaesslichkeit je Vektor (0..1): Bildstruktur und, falls beide Richtungen
+// vorliegen, deren Uebereinstimmung (gleichmaessige Bewegung: vor ~ -rueck).
+static void Confidence(const Image& I0, const Flow* fwd, const Flow* bwd, Image& C)
 {
-    if (fwd && fwd->empty()) fwd = nullptr;
-    if (bwd && bwd->empty()) bwd = nullptr;
-    if (!fwd && !bwd) return;
     const int w = I0.w, h = I0.h;
-    if ((fwd && (fwd->w() != w || fwd->h() != h)) || (bwd && (bwd->w() != w || bwd->h() != h))) return;
-
-    // 1) Struktur: kleinster Eigenwert des Strukturtensors (Ecken/Kanten = hoch, glatt = 0)
-    Image Sxx, Sxy, Syy;
-    {
-        Image Ixx, Ixy, Iyy;
-        Ixx.resize(w, h); Ixy.resize(w, h); Iyy.resize(w, h);
-        ParallelFor(0, h, [&](int y0, int y1) {
-            for (int y = y0; y < y1; ++y) {
-                const float* rm = I0.row(std::max(y - 1, 0));
-                const float* r  = I0.row(y);
-                const float* rp = I0.row(std::min(y + 1, h - 1));
-                for (int x = 0; x < w; ++x) {
-                    float gx = 0.5f * (r[std::min(x + 1, w - 1)] - r[std::max(x - 1, 0)]);
-                    float gy = 0.5f * (rp[x] - rm[x]);
-                    Ixx.row(y)[x] = gx * gx; Ixy.row(y)[x] = gx * gy; Iyy.row(y)[x] = gy * gy;
-                }
+    Image Ixx, Ixy, Iyy, Sxx, Sxy, Syy;
+    Ixx.resize(w, h); Ixy.resize(w, h); Iyy.resize(w, h);
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float* rm = I0.row(std::max(y - 1, 0));
+            const float* r  = I0.row(y);
+            const float* rp = I0.row(std::min(y + 1, h - 1));
+            for (int x = 0; x < w; ++x) {
+                float gx = 0.5f * (r[std::min(x + 1, w - 1)] - r[std::max(x - 1, 0)]);
+                float gy = 0.5f * (rp[x] - rm[x]);
+                Ixx.row(y)[x] = gx * gx; Ixy.row(y)[x] = gx * gy; Iyy.row(y)[x] = gy * gy;
             }
-        });
-        BoxFilter(Ixx, 3, Sxx); BoxFilter(Ixy, 3, Sxy); BoxFilter(Iyy, 3, Syy);
-    }
+        }
+    });
+    BoxFilter(Ixx, 3, Sxx); BoxFilter(Ixy, 3, Sxy); BoxFilter(Iyy, 3, Syy);
 
-    const float tau = 2e-5f; // ab hier gilt Struktur als "verlaesslich"
-    Image C; C.resize(w, h);
+    const float tau = 2e-5f;
+    C.resize(w, h);
     ParallelFor(0, h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)
             for (int x = 0; x < w; ++x) {
                 float a = Sxx.row(y)[x], b = Sxy.row(y)[x], c = Syy.row(y)[x];
-                float lmin = 0.5f * (a + c - std::sqrt((a - c) * (a - c) + 4.f * b * b));
-                lmin = std::max(0.f, lmin);
+                float lmin = std::max(0.f, 0.5f * (a + c - std::sqrt((a - c) * (a - c) + 4.f * b * b)));
                 float conf = lmin / (lmin + tau);
                 if (fwd && bwd) {
-                    // Bei gleichmaessiger Bewegung gilt vorwaerts ~ -rueckwaerts
                     float fu = fwd->u.row(y)[x], fv = fwd->v.row(y)[x];
                     float bu = bwd->u.row(y)[x], bv = bwd->v.row(y)[x];
                     float e = std::hypot(fu + bu, fv + bv);
@@ -410,30 +404,54 @@ void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd)
                 C.row(y)[x] = conf;
             }
     });
+}
 
-    // 2) Normalisierte Faltung mit mehreren Radien: der kleinste Radius, in dem
-    //    genug verlaessliche Vektoren liegen, liefert den Ersatzwert.
-    const int radii[] = { 3, 12, 40, 140 };
-    const int nR = 4;
+// Weicher Filter (zweimal Box = Dreiecksprofil), vermeidet eckige Bloecke.
+static void SoftFilter(const Image& src, int r, Image& dst)
+{
+    Image t;
+    BoxFilter(src, std::max(1, r / 2), t);
+    BoxFilter(t, std::max(1, r - r / 2), dst);
+}
+
+void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd)
+{
+    if (fwd && fwd->empty()) fwd = nullptr;
+    if (bwd && bwd->empty()) bwd = nullptr;
+    if (!fwd && !bwd) return;
+    const int w = I0.w, h = I0.h;
+    if ((fwd && (fwd->w() != w || fwd->h() != h)) || (bwd && (bwd->w() != w || bwd->h() != h))) return;
+
+    Image C;
+    Confidence(I0, fwd, bwd, C);
+
+    // Normalisierte Faltung mit mehreren Radien: der kleinste Radius, in dem
+    // genug verlaessliche Vektoren liegen, liefert den Ersatzwert.
+    const int radii[] = { 4, 12, 32 };
+    const int nR = 3;
     std::vector<Image> BC(nR);
-    for (int i = 0; i < nR; ++i) BoxFilter(C, radii[i], BC[i]);
+    for (int i = 0; i < nR; ++i) SoftFilter(C, radii[i], BC[i]);
 
     auto refine = [&](Flow& f) {
         Image cu, cv; cu.resize(w, h); cv.resize(w, h);
         for (size_t i = 0; i < C.d.size(); ++i) { cu.d[i] = C.d[i] * f.u.d[i]; cv.d[i] = C.d[i] * f.v.d[i]; }
         std::vector<Image> BU(nR), BV(nR);
-        for (int i = 0; i < nR; ++i) { BoxFilter(cu, radii[i], BU[i]); BoxFilter(cv, radii[i], BV[i]); }
+        for (int i = 0; i < nR; ++i) { SoftFilter(cu, radii[i], BU[i]); SoftFilter(cv, radii[i], BV[i]); }
         ParallelFor(0, h, [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < w; ++x) {
-                    int pick = -1;
-                    for (int i = 0; i < nR; ++i) if (BC[i].row(y)[x] > 0.15f) { pick = i; break; }
-                    if (pick < 0) {
-                        for (int i = nR - 1; i >= 0; --i) if (BC[i].row(y)[x] > 1e-4f) { pick = i; break; }
-                        if (pick < 0) continue;
+                    // weich zwischen den Radien ueberblenden statt hart umzuschalten
+                    float accU = 0, accV = 0, remain = 1.f;
+                    for (int i = 0; i < nR && remain > 1e-3f; ++i) {
+                        float bc = BC[i].row(y)[x];
+                        if (bc <= 1e-5f) continue;
+                        float wgt = (i == nR - 1) ? remain : remain * std::min(1.f, bc / 0.15f);
+                        accU += wgt * BU[i].row(y)[x] / bc;
+                        accV += wgt * BV[i].row(y)[x] / bc;
+                        remain -= wgt;
                     }
-                    float bc = BC[pick].row(y)[x];
-                    float fu = BU[pick].row(y)[x] / bc, fv = BV[pick].row(y)[x] / bc;
+                    if (remain > 0.999f) continue; // nirgends verlaessliche Werte
+                    float fu = accU / (1.f - remain), fv = accV / (1.f - remain);
                     float c = C.row(y)[x];
                     f.u.row(y)[x] = c * f.u.row(y)[x] + (1.f - c) * fu;
                     f.v.row(y)[x] = c * f.v.row(y)[x] + (1.f - c) * fv;
@@ -442,6 +460,183 @@ void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd)
     };
     if (fwd) refine(*fwd);
     if (bwd) refine(*bwd);
+}
+
+// ---------------------------------------------------------------------------
+// Globale Vorsuche
+// ---------------------------------------------------------------------------
+
+void EstimateGlobalShift(const Image& I0, const Image& I1, float& dx, float& dy)
+{
+    dx = dy = 0.f;
+    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return;
+    // auf max. ~96 px Kantenlaenge verkleinern
+    const int f = std::max(1, (std::max(I0.w, I0.h) + 95) / 96);
+    Image a, b;
+    Downscale(I0, f, a);
+    Downscale(I1, f, b);
+    const int w = a.w, h = a.h;
+    const int R = std::max(2, std::min(w, h) / 3); // Suchbereich +- R (verkleinerte px)
+    // Mittelwert entfernen (robuster bei Helligkeitsaenderung)
+    auto meanOf = [](const Image& im) { double s = 0; for (float v : im.d) s += v; return static_cast<float>(s / std::max<size_t>(1, im.d.size())); };
+    const float ma = meanOf(a), mb = meanOf(b);
+    double best = 1e30; int bx = 0, by = 0;
+    for (int sy = -R; sy <= R; ++sy)
+        for (int sx = -R; sx <= R; ++sx) {
+            // Ueberlappung muss gross genug sein
+            int x0 = std::max(0, -sx), x1 = std::min(w, w - sx);
+            int y0 = std::max(0, -sy), y1 = std::min(h, h - sy);
+            int ow = x1 - x0, oh = y1 - y0;
+            if (ow < w / 2 || oh < h / 2) continue;
+            double sad = 0;
+            for (int y = y0; y < y1; ++y) {
+                const float* ra = a.row(y);
+                const float* rb = b.row(y + sy);
+                for (int x = x0; x < x1; ++x) sad += std::fabs((ra[x] - ma) - (rb[x + sx] - mb));
+            }
+            sad /= (ow * oh);
+            // leichte Bevorzugung kleiner Verschiebungen (gegen Mehrdeutigkeit)
+            sad *= 1.0 + 0.002 * (sx * sx + sy * sy);
+            if (sad < best) { best = sad; bx = sx; by = sy; }
+        }
+    dx = static_cast<float>(bx * f);
+    dy = static_cast<float>(by * f);
+}
+
+// ---------------------------------------------------------------------------
+// Kameramodell (Homographie, RANSAC)
+// ---------------------------------------------------------------------------
+
+// Loest A x = b (n x n, Gauss mit Pivotsuche). false bei Singularitaet.
+static bool SolveLinear(std::vector<double>& A, std::vector<double>& b, int n)
+{
+    for (int c = 0; c < n; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < n; ++r) if (std::fabs(A[r * n + c]) > std::fabs(A[piv * n + c])) piv = r;
+        if (std::fabs(A[piv * n + c]) < 1e-12) return false;
+        if (piv != c) { for (int k = 0; k < n; ++k) std::swap(A[c * n + k], A[piv * n + k]); std::swap(b[c], b[piv]); }
+        for (int r = c + 1; r < n; ++r) {
+            double f = A[r * n + c] / A[c * n + c];
+            for (int k = c; k < n; ++k) A[r * n + k] -= f * A[c * n + k];
+            b[r] -= f * b[c];
+        }
+    }
+    for (int r = n - 1; r >= 0; --r) {
+        double s = b[r];
+        for (int k = r + 1; k < n; ++k) s -= A[r * n + k] * b[k];
+        b[r] = s / A[r * n + r];
+    }
+    return true;
+}
+
+struct Corr { double x, y, u, v; };
+
+// Homographie (h33 = 1) per kleinster Quadrate aus normierten Punkten.
+static bool FitH(const std::vector<Corr>& c, const std::vector<int>& idx, double H[9])
+{
+    if (idx.size() < 4) return false;
+    std::vector<double> AtA(64, 0.0), Atb(8, 0.0);
+    for (int i : idx) {
+        const Corr& p = c[i];
+        double r1[8] = { p.x, p.y, 1, 0, 0, 0, -p.u * p.x, -p.u * p.y };
+        double r2[8] = { 0, 0, 0, p.x, p.y, 1, -p.v * p.x, -p.v * p.y };
+        for (int a = 0; a < 8; ++a) {
+            Atb[a] += r1[a] * p.u + r2[a] * p.v;
+            for (int b = 0; b < 8; ++b) AtA[a * 8 + b] += r1[a] * r1[b] + r2[a] * r2[b];
+        }
+    }
+    if (!SolveLinear(AtA, Atb, 8)) return false;
+    for (int i = 0; i < 8; ++i) H[i] = Atb[i];
+    H[8] = 1.0;
+    return true;
+}
+
+static inline void ApplyH(const double H[9], double x, double y, double& u, double& v)
+{
+    double z = H[6] * x + H[7] * y + H[8];
+    if (std::fabs(z) < 1e-9) z = 1e-9;
+    u = (H[0] * x + H[1] * y + H[2]) / z;
+    v = (H[3] * x + H[4] * y + H[5]) / z;
+}
+
+// Schaetzt die Homographie fuer ein Vektorfeld und ersetzt es durch das Modell.
+static bool FitOne(Flow& f, const Image& C)
+{
+    const int w = f.w(), h = f.h();
+    // Stichproben auf einem Raster, nur verlaessliche Vektoren
+    const int step = std::max(1, static_cast<int>(std::sqrt(static_cast<double>(w) * h / 3000.0)));
+    // Normierung: Mittelpunkt 0, Ausdehnung ~1
+    const double cx = 0.5 * w, cy = 0.5 * h, sc = 2.0 / std::max(w, h);
+    std::vector<Corr> c;
+    std::vector<double> lens;
+    for (int y = step / 2; y < h; y += step)
+        for (int x = step / 2; x < w; x += step) {
+            if (C.row(y)[x] < 0.3f) continue;
+            double fu = f.u.row(y)[x], fv = f.v.row(y)[x];
+            c.push_back({ (x - cx) * sc, (y - cy) * sc, (x + fu - cx) * sc, (y + fv - cy) * sc });
+            lens.push_back(std::hypot(fu, fv));
+        }
+    if (c.size() < 40) return false;
+    std::nth_element(lens.begin(), lens.begin() + lens.size() / 2, lens.end());
+    const double medLen = lens[lens.size() / 2];
+    const double thr = std::max(0.75, 0.05 * medLen) * sc; // Toleranz (normiert)
+
+    auto inliersOf = [&](const double H[9], std::vector<int>& out) {
+        out.clear();
+        for (int i = 0; i < static_cast<int>(c.size()); ++i) {
+            double u, v; ApplyH(H, c[i].x, c[i].y, u, v);
+            if (std::hypot(u - c[i].u, v - c[i].v) < thr) out.push_back(i);
+        }
+    };
+
+    // RANSAC mit festem Startwert -> gleiche Eingabe, gleiches Ergebnis (kein Flackern)
+    uint32_t rng = 12345u;
+    auto rnd = [&](int n) { rng = rng * 1664525u + 1013904223u; return static_cast<int>((rng >> 8) % static_cast<uint32_t>(n)); };
+    double bestH[9]; std::vector<int> bestIn, in;
+    const int n = static_cast<int>(c.size());
+    for (int it = 0; it < 500; ++it) {
+        std::vector<int> pick;
+        while (pick.size() < 4) { int k = rnd(n); if (std::find(pick.begin(), pick.end(), k) == pick.end()) pick.push_back(k); }
+        double H[9];
+        if (!FitH(c, pick, H)) continue;
+        inliersOf(H, in);
+        if (in.size() > bestIn.size()) { bestIn = in; std::copy(H, H + 9, bestH); }
+    }
+    if (bestIn.size() < std::max<size_t>(30, c.size() / 4)) return false;
+    // Nachoptimieren auf allen Inliern
+    for (int r = 0; r < 2; ++r) {
+        double H[9];
+        if (!FitH(c, bestIn, H)) break;
+        std::copy(H, H + 9, bestH);
+        inliersOf(bestH, bestIn);
+    }
+
+    // Modellfeld schreiben
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                double nx = (x - cx) * sc, ny = (y - cy) * sc, u, v;
+                ApplyH(bestH, nx, ny, u, v);
+                f.u.row(y)[x] = static_cast<float>(u / sc + cx - x);
+                f.v.row(y)[x] = static_cast<float>(v / sc + cy - y);
+            }
+    });
+    return true;
+}
+
+bool FitCameraModel(const Image& I0, Flow* fwd, Flow* bwd)
+{
+    if (fwd && fwd->empty()) fwd = nullptr;
+    if (bwd && bwd->empty()) bwd = nullptr;
+    if (!fwd && !bwd) return false;
+    const int w = I0.w, h = I0.h;
+    if ((fwd && (fwd->w() != w || fwd->h() != h)) || (bwd && (bwd->w() != w || bwd->h() != h))) return false;
+    Image C;
+    Confidence(I0, fwd, bwd, C);
+    bool ok = true;
+    if (fwd) ok = FitOne(*fwd, C) && ok;
+    if (bwd) ok = FitOne(*bwd, C) && ok;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
