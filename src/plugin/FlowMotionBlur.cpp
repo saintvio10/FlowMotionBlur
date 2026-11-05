@@ -75,8 +75,23 @@ static double DownsampleY(const PF_InData* in_data)
 
 enum class PixKind { AE_ARGB8, AE_ARGB16, AE_ARGB32F, PR_BGRA8, PR_BGRA32F, Unknown };
 
+static int BytesPerPixel(PixKind k)
+{
+    switch (k) {
+    case PixKind::AE_ARGB8: case PixKind::PR_BGRA8: return 4;
+    case PixKind::AE_ARGB16: return 8;
+    case PixKind::AE_ARGB32F: case PixKind::PR_BGRA32F: return 16;
+    default: return 0;
+    }
+}
+
+// Ermittelt das Pixelformat. Die Angabe des Hosts wird gegen das tatsaechliche
+// Speicherlayout (Bytes pro Zeile / Breite) geprueft. Passt sie nicht oder fehlt
+// sie (in Premiere nicht immer verfuegbar), entscheidet das Speicherlayout.
 static PixKind GetPixKind(PF_InData* in_data, PF_EffectWorld* world)
 {
+    if (!world || !world->data || world->width <= 0) return PixKind::Unknown;
+
     PF_PixelFormat fmt = PF_PixelFormat_INVALID;
     {
         Suite<PF_WorldSuite2> ws(in_data, kPFWorldSuite, kPFWorldSuiteVersion2);
@@ -84,14 +99,25 @@ static PixKind GetPixKind(PF_InData* in_data, PF_EffectWorld* world)
     }
     const int f = static_cast<int>(fmt);
 
-    // Premiere liefert neben den angemeldeten BGRA-Formaten immer auch sein
-    // Standardformat ARGB 8 Bit (gleiches Layout wie in After Effects).
-    if (f == static_cast<int>(PrPixelFormat_BGRA_4444_8u))  return PixKind::PR_BGRA8;
-    if (f == static_cast<int>(PrPixelFormat_BGRA_4444_32f)) return PixKind::PR_BGRA32F;
-    if (f == static_cast<int>(PF_PixelFormat_ARGB128)) return PixKind::AE_ARGB32F;
-    if (f == static_cast<int>(PF_PixelFormat_ARGB64))  return PixKind::AE_ARGB16;
-    if (f == static_cast<int>(PF_PixelFormat_ARGB32))  return PixKind::AE_ARGB8;
-    return PF_WORLD_IS_DEEP(world) ? PixKind::AE_ARGB16 : PixKind::AE_ARGB8;
+    PixKind fromHost = PixKind::Unknown;
+    if      (f == static_cast<int>(PrPixelFormat_BGRA_4444_8u))  fromHost = PixKind::PR_BGRA8;
+    else if (f == static_cast<int>(PrPixelFormat_BGRA_4444_32f)) fromHost = PixKind::PR_BGRA32F;
+    else if (f == static_cast<int>(PF_PixelFormat_ARGB128))      fromHost = PixKind::AE_ARGB32F;
+    else if (f == static_cast<int>(PF_PixelFormat_ARGB64))       fromHost = PixKind::AE_ARGB16;
+    else if (f == static_cast<int>(PF_PixelFormat_ARGB32))       fromHost = PixKind::AE_ARGB8;
+
+    const long rb = world->rowbytes < 0 ? -static_cast<long>(world->rowbytes) : static_cast<long>(world->rowbytes);
+    const long bpp = rb / world->width; // Bytes pro Pixel (+ evtl. Zeilen-Padding)
+
+    const int hb = BytesPerPixel(fromHost);
+    if (hb > 0 && bpp >= hb && bpp < 2 * hb) return fromHost;
+
+    // Premiere: angemeldet ist nur BGRA 32 Bit Float; 8 Bit ist Premieres
+    // Standardformat ARGB (gleiches Layout wie in After Effects).
+    if (bpp >= 16) return IsPremiere(in_data) ? PixKind::PR_BGRA32F : PixKind::AE_ARGB32F;
+    if (bpp >= 8)  return PixKind::AE_ARGB16;
+    if (bpp >= 4)  return PixKind::AE_ARGB8;
+    return PixKind::Unknown;
 }
 
 static inline unsigned char ToU8(float v)
@@ -224,12 +250,13 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data)
     out_data->out_flags2 = 0;
 
     if (IsPremiere(in_data)) {
-        // Premiere: nur BGRA 8 Bit und 32 Bit Float anbieten.
+        // Premiere: zusaetzlich BGRA 32 Bit Float anbieten.
         Suite<PF_PixelFormatSuite1> pfs(in_data, kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
         if (pfs) {
             pfs->ClearSupportedPixelFormats(in_data->effect_ref);
+            // Nur 32 Bit Float anmelden. 8 Bit liefert Premiere dann im Standardformat
+            // ARGB; so sind beide Faelle allein am Speicherlayout unterscheidbar.
             pfs->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
-            pfs->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
         }
     }
     return PF_Err_NONE;
