@@ -1,0 +1,21 @@
+Flow Motion Blur 1.1 - Plugin fuer Adobe Premiere Pro (macOS, Intel + Apple-Chip)
+================================================================================
+
+INSTALLIEREN
+1. Premiere Pro beenden.
+2. Im Finder: Menue "Gehe zu" -> "Gehe zum Ordner ..." und eingeben:
+
+     /Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/
+
+3. "FlowMotionBlur.plugin" in diesen Ordner ziehen (Mac-Passwort eingeben).
+4. Weil das Plugin nicht von Apple beglaubigt ist, die Sperre entfernen:
+   Programm "Terminal" oeffnen, diese Zeile einfuegen, Enter, Passwort eingeben:
+
+     sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/FlowMotionBlur.plugin"
+
+5. Premiere Pro starten -> Effekte -> "Flow Motion Blur".
+
+BENUTZEN
+- Effekt auf einen Clip ziehen, Staerke ueber "Blur Amount (Shutter)" (0.5 = Film-Look).
+- Fuer schnelle Vorschau: "Analyse-Qualitaet" auf "Schnell".
+- "Ansicht: Bewegungsvektoren" zeigt, was als Bewegung erkannt wird.

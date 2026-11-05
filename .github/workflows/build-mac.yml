@@ -1,0 +1,53 @@
+name: Mac-Plugin bauen
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # Header des After Effects SDK (Kopie aus einem Open-Source-Plugin-Projekt,
+      # feste Version). Alternativ das offizielle SDK von Adobe verwenden.
+      - name: SDK-Header holen
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/bryful/F-s-PluginsProjects.git sdk
+          cd sdk
+          git sparse-checkout set Legacy/Headers Legacy/Util Legacy/Resources
+          git checkout db6dad3959522cfcd593dfe12a9fa4ad022d31e3
+
+      - name: Konfigurieren
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          -DAE_SDK="$PWD/sdk/Legacy"
+
+      - name: Bauen
+        run: cmake --build build --config Release -j 3
+
+      - name: Kern- und GPU-Test (OpenCL des Macs)
+        run: FMB_OPENCL_ALLOW_CPU=1 FMB_GPU_DEBUG=1 ./build/fmb_test build
+
+      - name: Signieren (ad hoc) und pruefen
+        run: |
+          codesign --force --deep --sign - build/FlowMotionBlur.plugin
+          codesign --verify --verbose build/FlowMotionBlur.plugin
+          lipo -info build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur
+          ls -la build/FlowMotionBlur.plugin/Contents build/FlowMotionBlur.plugin/Contents/Resources
+          nm -gU build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur | grep -E "EffectMain|PluginDataEntryFunction2"
+
+      - name: Paket schnueren
+        run: |
+          mkdir -p out/FlowMotionBlur_Mac
+          ditto build/FlowMotionBlur.plugin out/FlowMotionBlur_Mac/FlowMotionBlur.plugin
+          cp tools/ANLEITUNG_MAC.txt out/FlowMotionBlur_Mac/
+          cd out && ditto -c -k --keepParent FlowMotionBlur_Mac FlowMotionBlur_Mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowMotionBlur_Mac
+          path: out/FlowMotionBlur_Mac.zip
