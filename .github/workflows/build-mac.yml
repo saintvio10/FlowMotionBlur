@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   mac:
     runs-on: macos-14
@@ -51,3 +54,27 @@ jobs:
         with:
           name: FlowMotionBlur_Mac
           path: out/FlowMotionBlur_Mac.zip
+
+      # Fertige ZIP als Release (Download-Link) und im Zweig "mac-build" ablegen.
+      - name: Release veroeffentlichen
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mac-latest --yes --cleanup-tag || true
+          gh release create mac-latest out/FlowMotionBlur_Mac.zip \
+            --title "Flow Motion Blur fuer Mac (neuester Build)" \
+            --notes "FlowMotionBlur_Mac.zip herunterladen, entpacken, Anleitung in ANLEITUNG_MAC.txt befolgen."
+
+      - name: In Zweig mac-build ablegen
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp out/FlowMotionBlur_Mac.zip /tmp/
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan mac-build
+          git rm -rfq . && git clean -fdq
+          cp /tmp/FlowMotionBlur_Mac.zip .
+          git add FlowMotionBlur_Mac.zip
+          git commit -qm "Mac-Build ${GITHUB_SHA}"
+          git push -f origin mac-build
