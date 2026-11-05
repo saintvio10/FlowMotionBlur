@@ -84,11 +84,10 @@ static PixKind GetPixKind(PF_InData* in_data, PF_EffectWorld* world)
     }
     const int f = static_cast<int>(fmt);
 
-    if (IsPremiere(in_data)) {
-        if (f == static_cast<int>(PrPixelFormat_BGRA_4444_8u))  return PixKind::PR_BGRA8;
-        if (f == static_cast<int>(PrPixelFormat_BGRA_4444_32f)) return PixKind::PR_BGRA32F;
-        return PixKind::Unknown;
-    }
+    // Premiere liefert neben den angemeldeten BGRA-Formaten immer auch sein
+    // Standardformat ARGB 8 Bit (gleiches Layout wie in After Effects).
+    if (f == static_cast<int>(PrPixelFormat_BGRA_4444_8u))  return PixKind::PR_BGRA8;
+    if (f == static_cast<int>(PrPixelFormat_BGRA_4444_32f)) return PixKind::PR_BGRA32F;
     if (f == static_cast<int>(PF_PixelFormat_ARGB128)) return PixKind::AE_ARGB32F;
     if (f == static_cast<int>(PF_PixelFormat_ARGB64))  return PixKind::AE_ARGB16;
     if (f == static_cast<int>(PF_PixelFormat_ARGB32))  return PixKind::AE_ARGB8;
@@ -109,10 +108,10 @@ static inline A_u_short ToU16(float v)
 // Premiere arbeitet mit nicht vormultipliziertem Alpha, AE mit vormultipliziertem.
 // Intern wird vormultipliziert gerechnet, damit transparente Kanten sauber bleiben.
 // Fuer Vektor-Ebenen (premultiply = false) werden die Rohwerte gelesen.
-static void ReadWorld(const PF_EffectWorld* w, PixKind kind, fmb::RGBAImage& out, bool premultiply = true)
+static void ReadWorld(const PF_EffectWorld* w, PixKind kind, fmb::RGBAImage& out, bool straightAlpha, bool premultiply = true)
 {
     out.resize(w->width, w->height);
-    const bool straight = premultiply && (kind == PixKind::PR_BGRA8 || kind == PixKind::PR_BGRA32F);
+    const bool straight = premultiply && straightAlpha;
 
     fmb::ParallelFor(0, w->height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -151,11 +150,11 @@ static void ReadWorld(const PF_EffectWorld* w, PixKind kind, fmb::RGBAImage& out
     });
 }
 
-static void WriteWorld(const fmb::RGBAImage& img, PixKind kind, PF_EffectWorld* w)
+static void WriteWorld(const fmb::RGBAImage& img, PixKind kind, PF_EffectWorld* w, bool straightAlpha)
 {
     const int width = std::min<int>(img.w, w->width);
     const int height = std::min<int>(img.h, w->height);
-    const bool straight = (kind == PixKind::PR_BGRA8 || kind == PixKind::PR_BGRA32F);
+    const bool straight = straightAlpha;
 
     fmb::ParallelFor(0, height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -358,7 +357,10 @@ static bool ReadVectorLayer(PF_InData* in_data, PF_ParamDef* params[], int outW,
     AEFX_CLR_STRUCT(ck);
     err = PF_CHECKOUT_PARAM(in_data, FMB_VEC_LAYER, in_data->current_time,
                             in_data->time_step, in_data->time_scale, &ck);
-    if (err != PF_Err_NONE) return false;
+    if (err != PF_Err_NONE) {
+        if (err != PF_Interrupt_CANCEL) err = PF_Err_NONE; // keine Ebene -> Tracking
+        return false;
+    }
 
     bool ok = false;
     PF_EffectWorld* w = &ck.u.ld;
@@ -366,7 +368,7 @@ static bool ReadVectorLayer(PF_InData* in_data, PF_ParamDef* params[], int outW,
         PixKind kind = GetPixKind(in_data, w);
         if (kind != PixKind::Unknown) {
             fmb::RGBAImage vec;
-            ReadWorld(w, kind, vec, false);
+            ReadWorld(w, kind, vec, IsPremiere(in_data), false);
 
             const bool  normalized = params[FMB_VEC_ENCODING]->u.pd.value == ENCODING_NORMALIZED;
             const float maxDisp = static_cast<float>(params[FMB_VEC_MAX_DISP]->u.fs_d.value);
@@ -426,7 +428,11 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
     AEFX_CLR_STRUCT(ck);
     err = PF_CHECKOUT_PARAM(in_data, FMB_INPUT, in_data->current_time + offset,
                             in_data->time_step, in_data->time_scale, &ck);
-    if (err != PF_Err_NONE) return false;
+    if (err != PF_Err_NONE) {
+        // Abbruch durch den Benutzer weitergeben, alles andere = kein Nachbarframe
+        if (err != PF_Interrupt_CANCEL) err = PF_Err_NONE;
+        return false;
+    }
 
     bool ok = false;
     PF_EffectWorld* w = &ck.u.ld;
@@ -434,7 +440,7 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
         PixKind kind = GetPixKind(in_data, w);
         if (kind != PixKind::Unknown) {
             fmb::RGBAImage nb;
-            ReadWorld(w, kind, nb);
+            ReadWorld(w, kind, nb, IsPremiere(in_data));
             // Ausserhalb des Clips liefern Hosts oft ein leeres (transparentes) Bild.
             if (curAlpha <= 0.0 || AlphaSum(nb) > 0.02 * curAlpha) {
                 fmb::Image nbLuma;
@@ -444,8 +450,7 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
             }
         }
     }
-    PF_Err err2 = PF_CHECKIN_PARAM(in_data, &ck);
-    if (err == PF_Err_NONE) err = err2;
+    PF_CHECKIN_PARAM(in_data, &ck);
     return ok;
 }
 
@@ -457,7 +462,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     const PixKind inKind = GetPixKind(in_data, input);
     const PixKind outKind = GetPixKind(in_data, output);
     if (inKind == PixKind::Unknown || outKind == PixKind::Unknown)
-        return PF_Err_BAD_CALLBACK_PARAM;
+        return PF_COPY(input, output, NULL, NULL); // nie mit Fehler abbrechen
 
     const float amount    = static_cast<float>(params[FMB_AMOUNT]->u.fs_d.value);
     const int   samples   = params[FMB_MAX_SAMPLES]->u.sd.value;
@@ -474,7 +479,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 
     try {
         fmb::RGBAImage cur;
-        ReadWorld(input, inKind, cur);
+        ReadWorld(input, inKind, cur, IsPremiere(in_data));
 
         fmb::BlurParams bp;
         bp.shutter = amount;
@@ -487,7 +492,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             if (ReadVectorLayer(in_data, params, cur.w, cur.h, vec, err)) {
                 if (view == VIEW_VECTORS) fmb::VisualizeFlow(vec, 1, cur.w, cur.h, result);
                 else                      eng.Blur(cur, &vec, nullptr, 1, bp, result);
-                WriteWorld(result, outKind, output);
+                WriteWorld(result, outKind, output, IsPremiere(in_data));
                 return err;
             }
             if (err) return err;
@@ -529,7 +534,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         } else {
             eng.Blur(cur, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, factor, bp, result);
         }
-        WriteWorld(result, outKind, output);
+        WriteWorld(result, outKind, output, IsPremiere(in_data));
     } catch (const std::bad_alloc&) {
         return PF_Err_OUT_OF_MEMORY;
     } catch (...) {
