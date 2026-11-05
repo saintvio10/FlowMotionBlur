@@ -23,11 +23,13 @@
 #include "FlowMotionBlur.h"
 #include "../core/FlowCore.h"
 #include "../gpu/GpuBackend.h"
+#include "DiagText.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <new>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Suite-Helfer (ohne Abhaengigkeit von den Util-Dateien des SDK)
@@ -288,7 +290,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_CHECKBOXX("GPU verwenden", TRUE, 0, USE_GPU_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Ansicht", 2, VIEW_RESULT, "Ergebnis|Bewegungsvektoren", VIEW_DISK_ID);
+    PF_ADD_POPUP("Ansicht", 3, VIEW_RESULT, "Ergebnis|Bewegungsvektoren|Diagnose", VIEW_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Vektor-Quelle", 2, SOURCE_TRACKING, "Automatisch (Tracking)|Vektor-Ebene",
@@ -430,32 +432,76 @@ static bool ReadVectorLayer(PF_InData* in_data, PF_ParamDef* params[], int outW,
 
 struct Engine {
     bool useGpu;
+    mutable bool gpuUsed = false;
     void Flow(const fmb::Image& a, const fmb::Image& b, const fmb::FlowParams& fp,
               const std::vector<fmb::Guide>* g, fmb::Flow& out) const
     {
-        if (useGpu && fmb::gpu::ComputeFlow(a, b, fp, out, g)) return;
+        if (useGpu && fmb::gpu::ComputeFlow(a, b, fp, out, g)) { gpuUsed = true; return; }
         fmb::ComputeFlow(a, b, fp, out, g);
     }
     void Blur(const fmb::RGBAImage& src, const fmb::Flow* f, const fmb::Flow* b, int scale,
               const fmb::BlurParams& bp, fmb::RGBAImage& dst) const
     {
-        if (useGpu && fmb::gpu::ApplyMotionBlur(src, f, b, scale, bp, dst)) return;
+        if (useGpu && fmb::gpu::ApplyMotionBlur(src, f, b, scale, bp, dst)) { gpuUsed = true; return; }
         fmb::ApplyMotionBlur(src, f, b, scale, bp, dst);
     }
 };
+
+// Diagnose-Informationen zu einem Nachbarframe
+struct NbInfo {
+    std::string status = "NICHT ABGEFRAGT";
+    double diff = 0;    // mittlerer Helligkeitsunterschied zum aktuellen Bild
+    double motion = 0;  // mittlere erkannte Bewegung in Pixeln
+};
+
+static std::string Num(double v, int prec = 1)
+{
+    char b[64]; std::snprintf(b, sizeof(b), "%.*f", prec, v); return b;
+}
+
+static const char* KindName(PixKind k)
+{
+    switch (k) {
+    case PixKind::AE_ARGB8: return "ARGB 8";  case PixKind::AE_ARGB16: return "ARGB 16";
+    case PixKind::AE_ARGB32F: return "ARGB 32F"; case PixKind::PR_BGRA8: return "BGRA 8";
+    case PixKind::PR_BGRA32F: return "BGRA 32F"; default: return "UNBEKANNT";
+    }
+}
+
+// Bilineares Skalieren eines RGBA-Bildes (fuer Nachbarframes in anderer Groesse).
+static void ResizeRGBA(const fmb::RGBAImage& src, int w, int h, fmb::RGBAImage& dst)
+{
+    dst.resize(w, h);
+    const float sx = static_cast<float>(src.w) / w, sy = static_cast<float>(src.h) / h;
+    fmb::ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                float fx = std::min(std::max((x + 0.5f) * sx - 0.5f, 0.f), static_cast<float>(src.w - 1));
+                float fy = std::min(std::max((y + 0.5f) * sy - 0.5f, 0.f), static_cast<float>(src.h - 1));
+                int x0 = static_cast<int>(fx), y0i = static_cast<int>(fy);
+                int x1 = std::min(x0 + 1, src.w - 1), y1i = std::min(y0i + 1, src.h - 1);
+                float ax = fx - x0, ay = fy - y0i;
+                const float *a = src.px(x0, y0i), *b = src.px(x1, y0i), *c = src.px(x0, y1i), *d = src.px(x1, y1i);
+                float* o = dst.px(x, y);
+                for (int k = 0; k < 4; ++k)
+                    o[k] = (a[k] * (1 - ax) + b[k] * ax) * (1 - ay) + (c[k] * (1 - ax) + d[k] * ax) * ay;
+            }
+    });
+}
 
 // Holt den Frame bei current_time + offset und berechnet den Fluss dorthin.
 // Gibt false zurueck, wenn kein brauchbarer Nachbarframe existiert (Clip-Anfang/-Ende).
 static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImage& cur,
                           const fmb::Image& curLuma, int factor, const fmb::FlowParams& fp,
                           float alphaWeight, double curAlpha, const std::vector<fmb::Guide>& guides,
-                          const Engine& eng, fmb::Flow& flow, PF_Err& err)
+                          const Engine& eng, fmb::Flow& flow, PF_Err& err, NbInfo& info)
 {
     PF_ParamDef ck;
     AEFX_CLR_STRUCT(ck);
     err = PF_CHECKOUT_PARAM(in_data, FMB_INPUT, in_data->current_time + offset,
                             in_data->time_step, in_data->time_scale, &ck);
     if (err != PF_Err_NONE) {
+        info.status = "ABRUF FEHLGESCHLAGEN (CODE " + std::to_string(static_cast<int>(err)) + ")";
         // Abbruch durch den Benutzer weitergeben, alles andere = kein Nachbarframe
         if (err != PF_Interrupt_CANCEL) err = PF_Err_NONE;
         return false;
@@ -463,16 +509,37 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
 
     bool ok = false;
     PF_EffectWorld* w = &ck.u.ld;
-    if (w->data && w->width == cur.w && w->height == cur.h) {
+    if (!w->data || w->width <= 0 || w->height <= 0) {
+        info.status = "KEIN BILD GELIEFERT";
+    } else {
         PixKind kind = GetPixKind(in_data, w);
-        if (kind != PixKind::Unknown) {
+        if (kind == PixKind::Unknown) {
+            info.status = "FORMAT UNBEKANNT";
+        } else {
             fmb::RGBAImage nb;
             ReadWorld(w, kind, nb, IsPremiere(in_data));
+            std::string sizeNote;
+            if (nb.w != cur.w || nb.h != cur.h) {
+                // Premiere liefert Nachbarframes evtl. in Clip- statt Sequenzgroesse
+                sizeNote = " SKALIERT VON " + std::to_string(nb.w) + "X" + std::to_string(nb.h);
+                fmb::RGBAImage tmp;
+                ResizeRGBA(nb, cur.w, cur.h, tmp);
+                nb = std::move(tmp);
+            }
             // Ausserhalb des Clips liefern Hosts oft ein leeres (transparentes) Bild.
-            if (curAlpha <= 0.0 || AlphaSum(nb) > 0.02 * curAlpha) {
+            if (curAlpha > 0.0 && AlphaSum(nb) <= 0.02 * curAlpha) {
+                info.status = "TRANSPARENT (AUSSERHALB DES CLIPS)" + sizeNote;
+            } else {
                 fmb::Image nbLuma;
                 fmb::LumaFromRGBA(nb, factor, nbLuma, alphaWeight);
+                double d = 0;
+                for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
+                info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
                 eng.Flow(curLuma, nbLuma, fp, guides.empty() ? nullptr : &guides, flow);
+                double m = 0;
+                for (size_t i = 0; i < flow.u.d.size(); ++i) m += std::hypot(flow.u.d[i], flow.v.d[i]);
+                info.motion = flow.u.d.empty() ? 0 : m / flow.u.d.size() * factor;
+                info.status = (info.diff < 1e-4 ? "OK, ABER GLEICHES BILD" : "OK") + sizeNote;
                 ok = true;
             }
         }
@@ -541,17 +608,23 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         fmb::LumaFromRGBA(cur, factor, curLuma, alphaWeight);
         const double curAlpha = AlphaSum(cur);
 
-        A_long step = in_data->time_step != 0 ? in_data->time_step : in_data->local_time_step;
-        if (step == 0) step = 1;
+        // Abstand zum Nachbarframe. Fehlt die Angabe, ca. 1/25 s verwenden
+        // (frueher 1 Zeiteinheit -> praktisch derselbe Frame, keine Bewegung).
+        const char* stepSrc = "TIME_STEP";
+        A_long step = in_data->time_step;
+        if (step == 0) { step = in_data->local_time_step; stepSrc = "LOCAL_TIME_STEP"; }
+        if (step == 0) { step = std::max<A_long>(1, static_cast<A_long>(in_data->time_scale / 25)); stepSrc = "ERSATZ 1/25 S"; }
+        if (step < 0) step = -step;
 
         const std::vector<fmb::Guide> gF = CollectGuides(in_data, params, +step, factor);
         const std::vector<fmb::Guide> gB = CollectGuides(in_data, params, -step, factor);
 
         fmb::Flow fwd, bwd;
-        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gF, eng, fwd, err);
+        NbInfo infoF, infoB;
+        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gF, eng, fwd, err, infoF);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
-        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gB, eng, bwd, err);
+        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gB, eng, bwd, err, infoB);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
@@ -560,6 +633,24 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             fmb::VisualizeFlow(show, factor, cur.w, cur.h, result);
         } else {
             eng.Blur(cur, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, factor, bp, result);
+        }
+        if (view == VIEW_DIAG) {
+            std::vector<std::string> L;
+            L.push_back("FLOW MOTION BLUR 1.2 - DIAGNOSE");
+            L.push_back(std::string("HOST: ") + (IsPremiere(in_data) ? "PREMIERE" : "AFTER EFFECTS"));
+            L.push_back(std::string("FORMAT EIN/AUS: ") + KindName(inKind) + " / " + KindName(outKind));
+            L.push_back("BILD: " + std::to_string(cur.w) + "X" + std::to_string(cur.h) +
+                        "  AUSGABE: " + std::to_string(output->width) + "X" + std::to_string(output->height));
+            L.push_back("ZEIT: " + std::to_string(in_data->current_time) + "  SKALA: " + std::to_string(in_data->time_scale));
+            L.push_back("TIME_STEP: " + std::to_string(in_data->time_step) + "  LOCAL: " + std::to_string(in_data->local_time_step));
+            L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")");
+            L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
+            L.push_back("VORWAERTS: " + infoF.status);
+            L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
+            L.push_back("RUECKWAERTS: " + infoB.status);
+            L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
+            L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
+            diag::DrawLines(result, L);
         }
         WriteWorld(result, outKind, output, IsPremiere(in_data));
     } catch (const std::bad_alloc&) {
