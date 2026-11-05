@@ -358,6 +358,93 @@ void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& ou
 }
 
 // ---------------------------------------------------------------------------
+// Verlaesslichkeit + Auffuellen unsicherer Vektoren
+// ---------------------------------------------------------------------------
+
+void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd)
+{
+    if (fwd && fwd->empty()) fwd = nullptr;
+    if (bwd && bwd->empty()) bwd = nullptr;
+    if (!fwd && !bwd) return;
+    const int w = I0.w, h = I0.h;
+    if ((fwd && (fwd->w() != w || fwd->h() != h)) || (bwd && (bwd->w() != w || bwd->h() != h))) return;
+
+    // 1) Struktur: kleinster Eigenwert des Strukturtensors (Ecken/Kanten = hoch, glatt = 0)
+    Image Sxx, Sxy, Syy;
+    {
+        Image Ixx, Ixy, Iyy;
+        Ixx.resize(w, h); Ixy.resize(w, h); Iyy.resize(w, h);
+        ParallelFor(0, h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                const float* rm = I0.row(std::max(y - 1, 0));
+                const float* r  = I0.row(y);
+                const float* rp = I0.row(std::min(y + 1, h - 1));
+                for (int x = 0; x < w; ++x) {
+                    float gx = 0.5f * (r[std::min(x + 1, w - 1)] - r[std::max(x - 1, 0)]);
+                    float gy = 0.5f * (rp[x] - rm[x]);
+                    Ixx.row(y)[x] = gx * gx; Ixy.row(y)[x] = gx * gy; Iyy.row(y)[x] = gy * gy;
+                }
+            }
+        });
+        BoxFilter(Ixx, 3, Sxx); BoxFilter(Ixy, 3, Sxy); BoxFilter(Iyy, 3, Syy);
+    }
+
+    const float tau = 2e-5f; // ab hier gilt Struktur als "verlaesslich"
+    Image C; C.resize(w, h);
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                float a = Sxx.row(y)[x], b = Sxy.row(y)[x], c = Syy.row(y)[x];
+                float lmin = 0.5f * (a + c - std::sqrt((a - c) * (a - c) + 4.f * b * b));
+                lmin = std::max(0.f, lmin);
+                float conf = lmin / (lmin + tau);
+                if (fwd && bwd) {
+                    // Bei gleichmaessiger Bewegung gilt vorwaerts ~ -rueckwaerts
+                    float fu = fwd->u.row(y)[x], fv = fwd->v.row(y)[x];
+                    float bu = bwd->u.row(y)[x], bv = bwd->v.row(y)[x];
+                    float e = std::hypot(fu + bu, fv + bv);
+                    float m = 0.5f * (std::hypot(fu, fv) + std::hypot(bu, bv));
+                    float sigma = 0.5f + 0.25f * m;
+                    conf *= std::exp(-(e * e) / (2.f * sigma * sigma));
+                }
+                C.row(y)[x] = conf;
+            }
+    });
+
+    // 2) Normalisierte Faltung mit mehreren Radien: der kleinste Radius, in dem
+    //    genug verlaessliche Vektoren liegen, liefert den Ersatzwert.
+    const int radii[] = { 3, 12, 40, 140 };
+    const int nR = 4;
+    std::vector<Image> BC(nR);
+    for (int i = 0; i < nR; ++i) BoxFilter(C, radii[i], BC[i]);
+
+    auto refine = [&](Flow& f) {
+        Image cu, cv; cu.resize(w, h); cv.resize(w, h);
+        for (size_t i = 0; i < C.d.size(); ++i) { cu.d[i] = C.d[i] * f.u.d[i]; cv.d[i] = C.d[i] * f.v.d[i]; }
+        std::vector<Image> BU(nR), BV(nR);
+        for (int i = 0; i < nR; ++i) { BoxFilter(cu, radii[i], BU[i]); BoxFilter(cv, radii[i], BV[i]); }
+        ParallelFor(0, h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < w; ++x) {
+                    int pick = -1;
+                    for (int i = 0; i < nR; ++i) if (BC[i].row(y)[x] > 0.15f) { pick = i; break; }
+                    if (pick < 0) {
+                        for (int i = nR - 1; i >= 0; --i) if (BC[i].row(y)[x] > 1e-4f) { pick = i; break; }
+                        if (pick < 0) continue;
+                    }
+                    float bc = BC[pick].row(y)[x];
+                    float fu = BU[pick].row(y)[x] / bc, fv = BV[pick].row(y)[x] / bc;
+                    float c = C.row(y)[x];
+                    f.u.row(y)[x] = c * f.u.row(y)[x] + (1.f - c) * fu;
+                    f.v.row(y)[x] = c * f.v.row(y)[x] + (1.f - c) * fv;
+                }
+        });
+    };
+    if (fwd) refine(*fwd);
+    if (bwd) refine(*bwd);
+}
+
+// ---------------------------------------------------------------------------
 // Bewegungsunschaerfe
 // ---------------------------------------------------------------------------
 // Rekonstruktionsfilter nach McGuire et al. 2012 ("A Reconstruction Filter for
@@ -420,6 +507,34 @@ void ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     float globalMax = 0.f;
     for (float m : rowMax) globalMax = std::max(globalMax, m);
     if (globalMax < 0.5f) { dst.d = src.d; return; }
+
+    if (p.mode == kBlurNatural) {
+        // Jeder Pixel mittelt das Bild entlang seiner eigenen Bewegungsbahn
+        // (gleichmaessige Belichtung von -halbe bis +halbe Verschlusszeit).
+        const int maxS = std::max(1, p.maxSamples);
+        ParallelFor(0, H, [&](int y0, int y1) {
+            float c[4];
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float vx = VX.row(y)[x], vy = VY.row(y)[x];
+                    const float len = std::sqrt(vx * vx + vy * vy);
+                    const float* sx = src.px(x, y);
+                    float* o = dst.px(x, y);
+                    if (len < 0.25f) { o[0] = sx[0]; o[1] = sx[1]; o[2] = sx[2]; o[3] = sx[3]; continue; }
+                    int S = std::min(maxS, static_cast<int>(std::ceil(2.f * len)) + 1);
+                    if ((S & 1) == 0) ++S;
+                    float acc[4] = { 0, 0, 0, 0 };
+                    for (int i = 0; i < S; ++i) {
+                        float t = (S == 1) ? 0.f : -1.f + 2.f * i / (S - 1);
+                        SampleRGBA(src, x + vx * t, y + vy * t, c);
+                        for (int k = 0; k < 4; ++k) acc[k] += c[k];
+                    }
+                    const float inv = 1.f / S;
+                    o[0] = acc[0] * inv; o[1] = acc[1] * inv; o[2] = acc[2] * inv; o[3] = acc[3] * inv;
+                }
+        });
+        return;
+    }
 
     // 2) Kachel-Maximum (dominante Bewegung je Kachel) und 3x3-Nachbarschaftsmaximum.
     const int K = std::max(4, static_cast<int>(std::ceil(globalMax)));

@@ -68,9 +68,16 @@ struct FlowParams {
     float guideRadius    = 40.f;   // Einflussradius der Track Points (px, Fluss-Aufloesung)
 };
 
+// Art der Unschaerfe
+enum BlurMode {
+    kBlurNatural = 0, // jeder Pixel entlang seiner eigenen Bewegung (wie eine echte Kamera)
+    kBlurObjects = 1  // Rekonstruktionsfilter: schnelle Objekte verschmieren ueber den Hintergrund
+};
+
 struct BlurParams {
     float shutter    = 0.5f; // 0.5 = 180 Grad Verschluss, 1.0 = 360 Grad
     int   maxSamples = 32;   // Obergrenze Samples pro Pixel
+    int   mode       = kBlurNatural;
 };
 
 // Feste Konstanten des Rekonstruktionsfilters (CPU und GPU identisch).
@@ -95,6 +102,14 @@ void ApplyGuides(Flow& f, const std::vector<Guide>& guides, float radius, float 
 // Dichter Fluss von I0 nach I1: I0(x) ~ I1(x + flow(x)).
 void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& out,
                  const std::vector<Guide>* guides = nullptr);
+
+// Verbessert berechnete Vektorfelder (beide duerfen nullptr sein):
+// Jeder Vektor erhaelt eine Verlaesslichkeit aus der Bildstruktur (glatte
+// Flaechen = unsicher) und, wenn beide Richtungen vorliegen, aus deren
+// Uebereinstimmung. Unsichere Vektoren werden durch die Bewegung der
+// verlaesslichen Umgebung ersetzt (normalisierte Faltung, mehrere Radien).
+// I0 = Luminanz des aktuellen Bildes in Fluss-Aufloesung.
+void RefineFlows(const Image& I0, Flow* fwd, Flow* bwd);
 
 // Wendet Bewegungsunschaerfe an.
 //   fwd: Fluss aktuelles -> naechstes Bild (darf nullptr sein)

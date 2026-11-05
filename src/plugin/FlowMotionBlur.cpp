@@ -277,6 +277,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_SLIDER("Max Samples", 3, 256, 3, 64, 32, MAX_SAMPLES_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Unschaerfe-Modus", 2, MODE_NATURAL,
+                 "Natuerlich (Kamera)|Objekte (Vordergrund verschmiert)", BLUR_MODE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Analyse-Qualitaet", 3, QUALITY_NORMAL,
                  "Schnell (1/4)|Normal (1/2)|Hoch (voll)", QUALITY_DISK_ID);
 
@@ -578,6 +582,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         fmb::BlurParams bp;
         bp.shutter = amount;
         bp.maxSamples = samples;
+        bp.mode = (params[FMB_BLUR_MODE]->u.pd.value == MODE_OBJECTS) ? fmb::kBlurObjects : fmb::kBlurNatural;
         fmb::RGBAImage result;
 
         // --- Variante 1: Vektoren aus einer Ebene -------------------------
@@ -628,6 +633,10 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
+        // Unsichere Vektoren (glatte Flaechen, widerspruechliche Richtungen)
+        // durch die Bewegung der verlaesslichen Umgebung ersetzen.
+        fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
+
         if (view == VIEW_VECTORS) {
             const fmb::Flow& show = haveF ? fwd : bwd;
             fmb::VisualizeFlow(show, factor, cur.w, cur.h, result);
@@ -636,7 +645,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
         if (view == VIEW_DIAG) {
             std::vector<std::string> L;
-            L.push_back("FLOW MOTION BLUR 1.2 - DIAGNOSE");
+            L.push_back("FLOW MOTION BLUR " + std::to_string(FMB_MAJOR_VERSION) + "." + std::to_string(FMB_MINOR_VERSION) + " - DIAGNOSE");
             L.push_back(std::string("HOST: ") + (IsPremiere(in_data) ? "PREMIERE" : "AFTER EFFECTS"));
             L.push_back(std::string("FORMAT EIN/AUS: ") + KindName(inKind) + " / " + KindName(outKind));
             L.push_back("BILD: " + std::to_string(cur.w) + "X" + std::to_string(cur.h) +

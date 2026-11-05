@@ -238,6 +238,25 @@ __kernel void neighbor_max(__global const float* tmx, __global const float* tmy,
     nmx[ty * TW + tx] = bx; nmy[ty * TW + tx] = by;
 }
 
+// Natuerlicher Modus: Mittel entlang der eigenen Bewegungsbahn
+__kernel void natural_blur(__global const float4* src, __global const float* VX, __global const float* VY,
+                           int W, int H, int maxS, __global float4* dst)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= W || y >= H) return;
+    float vx = VX[y * W + x], vy = VY[y * W + x];
+    float len = sqrt(vx * vx + vy * vy);
+    if (len < 0.25f) { dst[y * W + x] = src[y * W + x]; return; }
+    int S = min(maxS, (int)ceil(2.0f * len) + 1);
+    if ((S & 1) == 0) ++S;
+    float4 acc = (float4)(0.0f);
+    for (int i = 0; i < S; ++i) {
+        float t = (S == 1) ? 0.0f : -1.0f + 2.0f * i / (S - 1);
+        acc += smp4(src, W, H, x + vx * t, y + vy * t);
+    }
+    dst[y * W + x] = acc * (1.0f / S);
+}
+
 inline float cone(float dist, float len) { return len > 1e-4f ? clamp(1.0f - dist / len, 0.0f, 1.0f) : 0.0f; }
 inline float cylinder(float dist, float len)
 {

@@ -8,12 +8,12 @@
 #define FMB_DESCRIPTION   "Vektorbasierte Bewegungsunschaerfe per optischem Fluss."
 
 #define FMB_MAJOR_VERSION 1
-#define FMB_MINOR_VERSION 2
+#define FMB_MINOR_VERSION 3
 #define FMB_BUG_VERSION   0
 #define FMB_STAGE_VERSION PF_Stage_DEVELOP
 #define FMB_BUILD_VERSION 1
 // Muss zu AE_Effect_Version in FlowMotionBlurPiPL.r passen:
-// PF_VERSION(1,2,0,PF_Stage_DEVELOP,1) = (1<<19)|(2<<15)|1 = 589825
+// PF_VERSION(1,3,0,PF_Stage_DEVELOP,1) = (1<<19)|(3<<15)|1 = 622593
 
 #define FMB_NUM_TRACK_POINTS 6
 
@@ -22,6 +22,7 @@ enum {
     FMB_INPUT = 0,
     FMB_AMOUNT,          // Belichtungszeit (Shutter), 0.5 = 180 Grad
     FMB_MAX_SAMPLES,     // max. Samples pro Pixel
+    FMB_BLUR_MODE,       // Natuerlich (Kamera) oder Objekte
     FMB_QUALITY,         // Aufloesung der Bewegungsanalyse
     FMB_SMOOTHING,       // Glaettung der Vektoren
     FMB_RGBA_TRACKING,   // Alphakanal fuer die Analyse mitverwenden
@@ -66,10 +67,12 @@ enum {
     TP_TOPIC_START_DISK_ID,
     TP_RADIUS_DISK_ID,
     TP_TOPIC_END_DISK_ID,
+    BLUR_MODE_DISK_ID,
     TP_FIRST_DISK_ID = 100 // je Punkt i: 100 + 2i (aktiv), 101 + 2i (Position)
 };
 
 enum { QUALITY_DRAFT = 1, QUALITY_NORMAL, QUALITY_HIGH };
+enum { MODE_NATURAL = 1, MODE_OBJECTS };
 enum { VIEW_RESULT = 1, VIEW_VECTORS, VIEW_DIAG };
 enum { SOURCE_TRACKING = 1, SOURCE_LAYER };
 enum { ENCODING_NORMALIZED = 1, ENCODING_PIXELS };

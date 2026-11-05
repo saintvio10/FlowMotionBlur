@@ -178,7 +178,7 @@ static State* CreateState()
 
     const char* names[] = { "downscale", "gradients", "box_h", "box_v", "warp_products", "solve",
                             "median3", "upsample_flow", "apply_guides", "velocity", "row_max",
-                            "tile_max", "neighbor_max", "reconstruct" };
+                            "tile_max", "neighbor_max", "reconstruct", "natural_blur" };
     for (const char* n : names) {
         cl_kernel k = api->CreateKernel(s->prog, n, &err);
         if (err != kCL_SUCCESS || !k) return nullptr;
@@ -439,6 +439,13 @@ bool ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
 
     dst.resize(W, H);
     if (globalMax < 0.5f) { dst.d = src.d; return true; }
+
+    if (p.mode == kBlurNatural) {
+        Buf out = S.Alloc(n * 4);
+        S.Run("natural_blur", W, H, img, VX, VY, W, H, std::max(1, p.maxSamples), out);
+        S.Download(out, dst.d.data(), dst.d.size());
+        return S.ok();
+    }
 
     const int K = std::max(4, static_cast<int>(std::ceil(globalMax)));
     const int TW = (W + K - 1) / K, TH = (H + K - 1) / K;

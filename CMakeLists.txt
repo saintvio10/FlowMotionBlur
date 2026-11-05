@@ -24,6 +24,8 @@ endif()
 # --- Test (laeuft ueberall, auch ohne SDK) ---------------------------------
 add_executable(fmb_test tests/test_core.cpp)
 target_link_libraries(fmb_test PRIVATE fmb_core)
+add_executable(fmb_test_drone tests/test_drone.cpp)
+target_link_libraries(fmb_test_drone PRIVATE fmb_core)
 
 # Prueft die OpenCL-Deklarationen gegen die Khronos-Header (falls vorhanden)
 find_path(OPENCL_HEADER_DIR CL/cl.h)
