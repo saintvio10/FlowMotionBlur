@@ -684,6 +684,25 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
+        // Plausibilitaet der Nachbarbilder: Bei Zeitverzerrung (Speed Ramp,
+        // Zeit-Neuzuordnung) liefert Premiere Nachbarbilder aus der unverzerrten
+        // Zeit, also von einer ganz anderen Stelle des Clips. Erkennbar daran, dass
+        // vorheriges und naechstes Bild sich aehneln, beide aber stark vom
+        // aktuellen Bild abweichen. Dann nicht verwischen, sondern Hinweis zeigen.
+        bool neighboursWrong = false;
+        double diffNP = 0;
+        if (haveF && haveB && lumF.w == lumB.w && lumF.h == lumB.h && !lumF.d.empty()) {
+            for (size_t i = 0; i < lumF.d.size(); ++i) diffNP += std::fabs(lumF.d[i] - lumB.d[i]);
+            diffNP /= lumF.d.size();
+            const double dCur = std::min(infoF.diff, infoB.diff);
+            neighboursWrong = dCur > 0.06 && diffNP < 0.4 * dCur;
+        }
+        if (neighboursWrong) {
+            infoF.status = "FALSCH (ANDERE STELLE IM CLIP)";
+            infoB.status = "FALSCH (ANDERE STELLE IM CLIP)";
+            haveF = haveB = false;
+        }
+
         std::string modelState = "AUS (FREI)";
         fmb::CameraInfo camInfo;
         if (cameraMode && (haveF || haveB)) {
@@ -719,6 +738,14 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         } else {
             eng.Blur(cur, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, factor, bp, result);
         }
+        if (neighboursWrong && view != VIEW_DIAG) {
+            std::vector<std::string> W;
+            W.push_back("FLOW MOTION BLUR: FALSCHE NACHBARBILDER");
+            W.push_back("SPEED RAMP / ZEITVERZERRUNG AM CLIP:");
+            W.push_back("CLIP VERSCHACHTELN, EFFEKT AUF DIE");
+            W.push_back("VERSCHACHTELTE SEQUENZ ANWENDEN");
+            diag::DrawLines(result, W);
+        }
         if (view == VIEW_DIAG) {
             std::vector<std::string> L;
             L.push_back("FLOW MOTION BLUR " + std::to_string(FMB_MAJOR_VERSION) + "." + std::to_string(FMB_MINOR_VERSION) + " - DIAGNOSE");
@@ -736,6 +763,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("RUECKWAERTS: " + infoB.status);
             L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  VORSUCHE " + Num(infoB.shift) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
             L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
+            L.push_back("NACHBARN UNTEREINANDER: " + Num(diffNP * 100, 2) + (neighboursWrong ? "  -> ZEITVERZERRUNG, CLIP VERSCHACHTELN" : ""));
             if (cameraMode) {
                 auto modelLines = [&](const char* name, bool have, float sx, float sy, const char* why,
                                       double cost, double zero, const double* Hm) {
