@@ -318,20 +318,46 @@ private:
         if (!fmb::metal::Luma(mMtlDevice, mMtlQueue, cur, factor, alphaWeight, curLuma, curAlpha)) {
             SetRenderStatus("METAL: " + fmb::metal::LastError(), true); return suiteError_Fail;
         }
+        // Zwischenspeicher: Beim Abspielen sind 3 der 4 Nachbarbilder schon vom
+        // vorherigen Bild bekannt. Nur neue Bilder werden auf der GPU ausgewertet.
+        const PrTime ticks = rp->inRenderTicksPerFrame;
+        const PrTime tol = std::max<PrTime>(1, ticks / 4);
+        int lumaNew = 0, lumaHit = 0;
+        {
+            std::lock_guard<std::mutex> l(mMutex);
+            if (CacheEntry* e = FindCache(rp->inSequenceTime, tol, curLuma.w, curLuma.h, factor, alphaWeight)) {
+                // Inhalt geaendert (z. B. Korrektur darunter): Zwischenspeicher verwerfen
+                if (MeanAbsDiff(e->luma, curLuma) > 0.003) mCache.clear();
+            }
+            PutCache(rp->inSequenceTime, tol, curLuma, curAlpha, factor, alphaWeight);
+        }
         struct Nb { bool have = false; fmb::Image luma; double diff = 1; };
         Nb nb[4];
         for (int i = 0; i < 4; ++i) {
             if (static_cast<csSDK_size_t>(i + 1) >= inFrameCount) break;
-            fmb::metal::Frame f; PrPixelFormat ff = PrPixelFormat_Invalid;
-            if (!FrameOf(inFrames[i + 1], f, ff)) continue;
+            const PrTime ti = rp->inSequenceTime + kDepOffsets[i] * ticks;
             double a = 0;
-            fmb::Image l;
-            const int f2 = (f.w == cur.w) ? factor : std::max(1, static_cast<int>(std::lround(factor * static_cast<double>(f.w) / cur.w)));
-            if (!fmb::metal::Luma(mMtlDevice, mMtlQueue, f, f2, alphaWeight, l, a)) continue;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> l(mMutex);
+                if (CacheEntry* e = FindCache(ti, tol, curLuma.w, curLuma.h, factor, alphaWeight)) {
+                    nb[i].luma = e->luma; a = e->alpha; found = true; ++lumaHit;
+                }
+            }
+            if (!found) {
+                fmb::metal::Frame f; PrPixelFormat ff = PrPixelFormat_Invalid;
+                if (!FrameOf(inFrames[i + 1], f, ff)) continue;
+                fmb::Image l;
+                const int f2 = (f.w == cur.w) ? factor : std::max(1, static_cast<int>(std::lround(factor * static_cast<double>(f.w) / cur.w)));
+                if (!fmb::metal::Luma(mMtlDevice, mMtlQueue, f, f2, alphaWeight, l, a)) continue;
+                if (l.w != curLuma.w || l.h != curLuma.h) ResizeLuma(l, curLuma.w, curLuma.h, nb[i].luma);
+                else nb[i].luma = std::move(l);
+                ++lumaNew;
+                std::lock_guard<std::mutex> lk(mMutex);
+                PutCache(ti, tol, nb[i].luma, a, factor, alphaWeight);
+            }
             // Ausserhalb des Clips: leeres (transparentes) Bild
             if (curAlpha > 0.0 && a <= 0.02 * curAlpha) continue;
-            if (l.w != curLuma.w || l.h != curLuma.h) ResizeLuma(l, curLuma.w, curLuma.h, nb[i].luma);
-            else nb[i].luma = std::move(l);
             nb[i].have = true;
             nb[i].diff = MeanAbsDiff(nb[i].luma, curLuma);
         }
@@ -417,7 +443,7 @@ private:
             return std::to_string(static_cast<int>(std::chrono::duration<double, std::milli>(b - a).count()));
         };
         SetRenderStatus(std::to_string(cur.w) + "X" + std::to_string(cur.h) + (cur.isHalf ? " 16F" : " 32F") +
-                        "  " + std::to_string(inFrameCount) + " EIN  " + what + (rep > 1 ? "  DOPPELT" : "") +
+                        "  " + std::to_string(inFrameCount) + " EIN " + std::to_string(lumaNew) + " NEU  " + what + (rep > 1 ? "  DOPPELT" : "") +
                         "  MS "  + ms(t0, tLuma) + " / " + ms(tLuma, tFlow) + " / " + ms(tFlow, tEnd));
         return suiteError_NoError;
     }
@@ -435,6 +461,27 @@ private:
     fmb::CameraPrior mPrior;
     PrTime mPriorTime = 0;
     bool mHavePrior = false;
+
+    // Luminanz bereits gesehener Bilder (nach Sequenzzeit)
+    struct CacheEntry { PrTime t = 0; int w = 0, h = 0, factor = 0; float aw = 0; fmb::Image luma; double alpha = 0; uint64_t use = 0; };
+    std::vector<CacheEntry> mCache;
+    uint64_t mTick = 0;
+    CacheEntry* FindCache(PrTime t, PrTime tol, int w, int h, int factor, float aw)
+    {
+        for (CacheEntry& e : mCache)
+            if (std::llabs(e.t - t) <= tol && e.w == w && e.h == h && e.factor == factor && e.aw == aw) { e.use = ++mTick; return &e; }
+        return nullptr;
+    }
+    void PutCache(PrTime t, PrTime tol, const fmb::Image& luma, double alpha, int factor, float aw)
+    {
+        if (CacheEntry* e = FindCache(t, tol, luma.w, luma.h, factor, aw)) { e->luma = luma; e->alpha = alpha; return; }
+        CacheEntry e; e.t = t; e.w = luma.w; e.h = luma.h; e.factor = factor; e.aw = aw; e.luma = luma; e.alpha = alpha; e.use = ++mTick;
+        mCache.push_back(std::move(e));
+        while (mCache.size() > 12) {
+            auto oldest = std::min_element(mCache.begin(), mCache.end(), [](const CacheEntry& x, const CacheEntry& y) { return x.use < y.use; });
+            mCache.erase(oldest);
+        }
+    }
 };
 
 // --- Funktionstabelle fuer Premiere ---------------------------------------
