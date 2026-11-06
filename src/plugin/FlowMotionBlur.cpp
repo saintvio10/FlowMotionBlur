@@ -632,23 +632,30 @@ struct InstanceState {
             auto oldest = std::min_element(frames.begin(), frames.end(), [](const Entry& x, const Entry& y) { return x.use < y.use; });
             frames.erase(oldest);
         }
-        while (frames.size() > 16) {
+        while (frames.size() > 32) {
             auto oldest = std::min_element(frames.begin(), frames.end(), [](const Entry& x, const Entry& y) { return x.use < y.use; });
             frames.erase(oldest);
         }
     }
 };
 
-static std::shared_ptr<InstanceState> GetInstanceState(A_long instanceId)
+// Premiere rechnet mehrere Bilder gleichzeitig in mehreren Threads, jeder mit
+// eigener Effekt-Kennung. Der Zustand wird daher je Clip (Ebenen-/Clipstart)
+// gemeinsam gefuehrt, sonst sieht jeder Thread nur jedes x-te Bild.
+static std::mutex gStateMutex;
+static std::map<std::string, std::shared_ptr<InstanceState>> gStates;
+static std::map<A_long, int> gSeenInstances; // nur fuer die Diagnose
+
+static std::shared_ptr<InstanceState> GetInstanceState(const std::string& key, A_long instanceId)
 {
-    if (instanceId == 0) return nullptr;
-    static std::mutex gm;
-    static std::map<A_long, std::shared_ptr<InstanceState>> states;
-    std::lock_guard<std::mutex> lock(gm);
-    auto& sp = states[instanceId];
+    if (key.empty()) return nullptr;
+    std::lock_guard<std::mutex> lock(gStateMutex);
+    if (instanceId != 0 && gSeenInstances.size() < 1000) gSeenInstances[instanceId] = 1;
+    auto& sp = gStates[key];
     if (!sp) sp = std::make_shared<InstanceState>();
     return sp;
 }
+static size_t SeenInstances() { std::lock_guard<std::mutex> lock(gStateMutex); return gSeenInstances.size(); }
 
 // Holt den Frame bei current_time + offset und berechnet den Fluss dorthin.
 // Gibt false zurueck, wenn kein brauchbarer Nachbarframe existiert (Clip-Anfang/-Ende).
@@ -885,6 +892,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         double selfDiff = -1.0;
         std::string offsetNote = "0";
         A_long instanceId = 0;
+        std::string stateKey;
         if (IsPremiere(in_data)) {
             A_long trackStart = 0, clipStart = 0;
             {
@@ -895,12 +903,17 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                     if (us->GetClipStart) us->GetClipStart(in_data->effect_ref, &clipStart);
                 }
             }
-            const std::string key = std::to_string(instanceId) + "/" + std::to_string(trackStart) + "/" +
-                                    std::to_string(clipStart) + "/" + std::to_string(in_data->time_scale);
+            // Gemeinsamer Schluessel fuer alle Threads desselben Clips. Ohne Start-Angaben
+            // (beide 0) laesst sich der Clip nicht sicher erkennen: dann je Instanz.
+            const std::string clipKey = std::to_string(trackStart) + "/" + std::to_string(clipStart) + "/" +
+                                        std::to_string(in_data->time_scale);
+            if (trackStart != 0 || clipStart != 0) stateKey = clipKey;
+            else if (instanceId != 0) stateKey = "I" + std::to_string(instanceId) + "/" + clipKey;
+            const std::string key = stateKey;
             static std::mutex cacheMutex;
             static std::map<std::string, A_long> offsetCache;
             bool cached = false;
-            if (instanceId != 0) {
+            if (!key.empty()) {
                 std::lock_guard<std::mutex> lock(cacheMutex);
                 auto it = offsetCache.find(key);
                 if (it != offsetCache.end()) { timeOffset = it->second; cached = true; }
@@ -927,7 +940,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                     if (best > 0.01) timeOffset = 0; // nichts passt: ohne Versatz
                 }
                 selfDiff = best;
-                if (instanceId != 0 && !cached) {
+                if (!key.empty() && !cached) {
                     std::lock_guard<std::mutex> lock(cacheMutex);
                     offsetCache[key] = timeOffset;
                 }
@@ -937,7 +950,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
 
         // Zustand dieser Effektinstanz (Zwischenspeicher, Muster, letzte Kamerabewegung)
-        std::shared_ptr<InstanceState> state = GetInstanceState(instanceId);
+        std::shared_ptr<InstanceState> state = GetInstanceState(stateKey, instanceId);
         bool cacheFlushed = false;
         if (state) {
             // Aktuelles Bild merken - es ist beim naechsten Bild der Nachbar. Liegt fuer
@@ -1122,7 +1135,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             if (state) {
                 std::lock_guard<std::mutex> lock(state->m);
                 L.push_back("ZWISCHENSPEICHER: " + std::to_string(state->frames.size()) + " BILDER  TREFFER " +
-                            std::to_string(state->hits) + "  ABRUFE " + std::to_string(state->misses) + "  GELEERT " + std::to_string(state->flushes) + (cacheFlushed ? " (JETZT)" : ""));
+                            std::to_string(state->hits) + "  ABRUFE " + std::to_string(state->misses) + "  GELEERT " + std::to_string(state->flushes) + (cacheFlushed ? " (JETZT)" : "") +
+                            "  THREADS " + std::to_string(SeenInstances()));
             }
             L.push_back("VORWAERTS: " + infoF.status + (kF > 1 ? "  (" + std::to_string(kF) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");

@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -54,6 +55,7 @@ std::mutex gStatusMutex;
 std::string gStatusInit = "-", gStatusRender = "-";
 long gInstOk = 0, gInstNo = 0, gRenders = 0, gRendersOk = 0, gRendersFail = 0;
 std::string gLastFail = "-";
+std::map<std::string, int> gReasons; // Ablehnungsgruende mit Anzahl
 
 // Zeile 1: Starts (aktiv/abgelehnt, letzter Grund). Zeile 2: Bilder und letztes Ergebnis.
 void WriteStatus()
@@ -62,7 +64,10 @@ void WriteStatus()
         const auto p = StatusFile();
         std::filesystem::create_directories(p.parent_path());
         std::ofstream f(p);
-        f << "STARTS: AKTIV " << gInstOk << "  ABGELEHNT " << gInstNo << "  ZULETZT: " << gStatusInit << "\n"
+        std::string why;
+        for (const auto& r : gReasons) why += (why.empty() ? "" : ", ") + r.first + " " + std::to_string(r.second);
+        f << "STARTS: AKTIV " << gInstOk << "  ABGELEHNT " << gInstNo << (why.empty() ? "" : " (" + why + ")") << "\n"
+          << "  ZULETZT: " << gStatusInit << "\n"
           << "BILDER: " << gRenders << "  OK " << gRendersOk << "  FEHLER " << gRendersFail
           << (gRendersFail ? "  LETZTER FEHLER: " + gLastFail : std::string()) << "\n"
           << "LETZTES: " << gStatusRender << "\n";
@@ -72,6 +77,7 @@ void SetInitStatus(const std::string& s, bool ok = false)
 {
     std::lock_guard<std::mutex> l(gStatusMutex);
     (ok ? gInstOk : gInstNo)++;
+    if (!ok && gReasons.size() < 12) ++gReasons[s];
     gStatusInit = s; WriteStatus();
 }
 // Wird am Ende jedes Render-Aufrufs gesetzt (Erfolg oder Grund des Abbruchs)
@@ -145,32 +151,41 @@ public:
             sp->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, (const void**)&mPPix) != kSPNoError ||
             sp->AcquireSuite(kPrSDKVideoSegmentSuite, kPrSDKVideoSegmentSuiteVersion, (const void**)&mSegment) != kSPNoError ||
             !mDevice || !mPPix || !mSegment) {
-            SetInitStatus("SUITES FEHLEN, SOFTWARE");
+            SetInitStatus("SUITES FEHLEN");
             return suiteError_Fail;
         }
         mDeviceIndex = inst->inDeviceIndex;
         PrGPUDeviceInfo info = {};
         if (mDevice->GetDeviceInfo(kPrSDKGPUDeviceSuiteVersion, mDeviceIndex, &info) != suiteError_NoError) {
-            SetInitStatus("GERAET UNBEKANNT, SOFTWARE");
+            SetInitStatus("GERAET UNBEKANNT");
             return suiteError_Fail;
         }
         if (info.outDeviceFramework != PrGPUDeviceFramework_Metal) {
-            SetInitStatus("PREMIERE NUTZT KEIN METAL (OPENCL/CUDA), SOFTWARE");
+            SetInitStatus("KEIN METAL");
             return suiteError_Fail;
         }
         mMtlDevice = info.outDeviceHandle;
         mMtlQueue = info.outCommandQueueHandle;
-        if (!mMtlDevice || !mMtlQueue) { SetInitStatus("KEIN METAL-GERAET, SOFTWARE"); return suiteError_Fail; }
+        if (!mMtlDevice || !mMtlQueue) { SetInitStatus("KEIN METAL-GERAET"); return suiteError_Fail; }
 
         // Nur der einfache, haeufige Fall laeuft auf Premieres GPU-Weg.
         const PrTime t0 = 0;
-        if (Num0(FMB_PR_GPU, t0) == 0) { SetInitStatus("OPTION AUS, SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_VIEW, t0) != VIEW_RESULT) { SetInitStatus("ANSICHT NICHT ERGEBNIS, SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_BLUR_MODE, t0) != MODE_NATURAL) { SetInitStatus("MODUS OBJEKTE, SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_VECTOR_SOURCE, t0) != SOURCE_TRACKING) { SetInitStatus("VEKTOR-EBENE, SOFTWARE"); return suiteError_Fail; }
+        if (Num0(FMB_PR_GPU, t0) == 0) { SetInitStatus("OPTION AUS"); return suiteError_Fail; }
+        if (Pop(FMB_VIEW, t0) != VIEW_RESULT) { SetInitStatus("ANSICHT"); return suiteError_Fail; }
+        if (Pop(FMB_BLUR_MODE, t0) != MODE_NATURAL) { SetInitStatus("OBJEKT-MODUS"); return suiteError_Fail; }
+        if (Pop(FMB_VECTOR_SOURCE, t0) != SOURCE_TRACKING) { SetInitStatus("VEKTOR-EBENE"); return suiteError_Fail; }
+        // Track Points: Ob Premiere hier die Gruppen-Anfaenge/-Enden mitzaehlt, ist nicht
+        // dokumentiert. Daher beide Zaehlweisen pruefen (3 Gruppenmarken davor);
+        // gewertet wird nur ein echter Schalter (Bool), der an ist.
         for (int i = 0; i < FMB_NUM_TRACK_POINTS; ++i) {
-            PrParam p = Get(FMB_TP_ON(i), t0);
-            if (p.mType != kPrParamType_Bool || p.mBool) { SetInitStatus("TRACK POINT AKTIV, SOFTWARE"); return suiteError_Fail; }
+            for (int shift : { 0, 3 }) {
+                PrParam p = Get(FMB_TP_ON(i) - shift, t0);
+                if (p.mType == kPrParamType_Bool && p.mBool) {
+                    // Nachbar muss ein Punkt sein, sonst ist es nicht der Track-Point-Schalter
+                    PrParam pos = Get(FMB_TP_POS(i) - shift, t0);
+                    if (pos.mType == kPrParamType_Point) { SetInitStatus("TRACK POINT"); return suiteError_Fail; }
+                }
+            }
         }
         SetInitStatus("AKTIV (METAL)", true);
         return suiteError_NoError;
