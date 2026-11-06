@@ -53,7 +53,7 @@ std::filesystem::path StatusFile()
 
 std::mutex gStatusMutex;
 std::string gStatusInit = "-", gStatusRender = "-";
-long gInstOk = 0, gInstNo = 0, gRenders = 0, gRendersOk = 0, gRendersFail = 0;
+long gDeps = 0, gInstOk = 0, gInstNo = 0, gRenders = 0, gRendersOk = 0, gRendersFail = 0;
 std::string gLastFail = "-";
 std::map<std::string, int> gReasons; // Ablehnungsgruende mit Anzahl
 
@@ -68,7 +68,7 @@ void WriteStatus()
         for (const auto& r : gReasons) why += (why.empty() ? "" : ", ") + r.first + " " + std::to_string(r.second);
         f << "STARTS: AKTIV " << gInstOk << "  ABGELEHNT " << gInstNo << (why.empty() ? "" : " (" + why + ")") << "\n"
           << "  ZULETZT: " << gStatusInit << "\n"
-          << "BILDER: " << gRenders << "  OK " << gRendersOk << "  FEHLER " << gRendersFail
+          << "ABFRAGEN NACHBARN: " << gDeps << "  BILDER: " << gRenders << "  OK " << gRendersOk << "  FEHLER " << gRendersFail
           << (gRendersFail ? "  LETZTER FEHLER: " + gLastFail : std::string()) << "\n"
           << "LETZTES: " << gStatusRender << "\n";
     } catch (...) {}
@@ -195,6 +195,7 @@ public:
                                       PrGPUFilterFrameDependency* out)
     {
         const int qi = ioQueryIndex ? *ioQueryIndex : 0;
+        if (qi == 0) { std::lock_guard<std::mutex> l(gStatusMutex); ++gDeps; WriteStatus(); }
         if (qi < 0 || qi >= 4) return suiteError_InvalidParms;
         out->outDependencyType = PrGPUDependency_InputFrame;
         out->outTrackID = 0;

@@ -615,10 +615,13 @@ struct InstanceState {
 
     static constexpr size_t kMaxBytes = 192u << 20; // max. ~192 MB je Instanz
 
+    // Zeiten gelten als gleich, wenn sie weniger als ein Viertel Bild auseinanderliegen
+    // (Premieres gemeldeter Bildabstand weicht um 1 Einheit vom echten ab, z. B. 2001 statt 2002).
+    A_long tol = 0;
     Entry* Find(A_long t, int w, int h, int factor, float aw)
     {
         for (Entry& e : frames)
-            if (e.time == t && e.w == w && e.h == h && e.factor == factor && e.alphaW == aw) { e.use = ++tick; return &e; }
+            if (std::labs(static_cast<long>(e.time - t)) <= tol && e.w == w && e.h == h && e.factor == factor && e.alphaW == aw) { e.use = ++tick; return &e; }
         return nullptr;
     }
     void Put(A_long t, int w, int h, int factor, float aw, const fmb::Image& luma, double alpha)
@@ -949,6 +952,12 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                          "  EBENENSTART " + std::to_string(trackStart) + "  CLIPSTART " + std::to_string(clipStart);
         }
 
+        // Nachbarbilder in der Bildmitte abfragen: Premiere meldet den Bildabstand teils
+        // um 1 Einheit zu klein (59,94 fps: 2001 statt 2002 bei Skala 120000). Ein Abruf
+        // genau bei 'jetzt + Abstand' traf dann noch das aktuelle Bild ("doppelte Bilder",
+        // Bewegung halbiert). Mit halbem Bild Abstand zur Grenze ist das ausgeschlossen.
+        const A_long half = baseStep / 2;
+
         // Zustand dieser Effektinstanz (Zwischenspeicher, Muster, letzte Kamerabewegung)
         std::shared_ptr<InstanceState> state = GetInstanceState(stateKey, instanceId);
         bool cacheFlushed = false;
@@ -957,7 +966,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             // diesen Zeitpunkt schon ein anderes Bild vor, hat sich der Inhalt geaendert
             // (z. B. Farbkorrektur darunter): dann den Zwischenspeicher leeren.
             std::lock_guard<std::mutex> lock(state->m);
-            const A_long tNow = in_data->current_time + timeOffset;
+            state->tol = std::max<A_long>(0, baseStep / 4);
+            const A_long tNow = in_data->current_time + timeOffset + half;
             if (InstanceState::Entry* e = state->Find(tNow, cur.w, cur.h, factor, alphaWeight)) {
                 double dd = 0;
                 if (e->luma.d.size() == curLuma.d.size())
@@ -999,7 +1009,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
         for (int k = kStart; k <= 4; ++k) {
             NbInfo tmp;
-            haveF = NeighbourFlow(in_data, timeOffset + dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF, state.get());
+            haveF = NeighbourFlow(in_data, timeOffset + half + dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF, state.get());
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoF = tmp; kF = k;
@@ -1007,7 +1017,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
         for (int k = kStart; k <= 4; ++k) {
             NbInfo tmp;
-            haveB = NeighbourFlow(in_data, timeOffset - dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB, state.get());
+            haveB = NeighbourFlow(in_data, timeOffset + half - dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB, state.get());
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoB = tmp; kB = k;
