@@ -7,13 +7,13 @@
 #define FMB_CATEGORY      "Flow Motion Blur"
 #define FMB_DESCRIPTION   "Vektorbasierte Bewegungsunschaerfe per optischem Fluss."
 
-#define FMB_MAJOR_VERSION 1
-#define FMB_MINOR_VERSION 9
+#define FMB_MAJOR_VERSION 2
+#define FMB_MINOR_VERSION 0
 #define FMB_BUG_VERSION   0
 #define FMB_STAGE_VERSION PF_Stage_DEVELOP
 #define FMB_BUILD_VERSION 1
 // Muss zu AE_Effect_Version in FlowMotionBlurPiPL.r passen:
-// PF_VERSION(1,9,0,PF_Stage_DEVELOP,1) = (1<<19)|(9<<15)|1 = 819201
+// PF_VERSION(2,0,0,PF_Stage_DEVELOP,1) = (2<<19)|1 = 1048577
 
 #define FMB_NUM_TRACK_POINTS 6
 

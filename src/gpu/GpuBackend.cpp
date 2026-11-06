@@ -440,7 +440,7 @@ bool ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     float globalMax = 0.f;
     for (float m : rowMax) globalMax = std::max(globalMax, m);
 
-    dst.resize(W, H);
+    dst.ensure(W, H); // wird vollstaendig ueberschrieben
     if (globalMax < 0.5f) { dst.d = src.d; return true; }
 
     if (p.mode == kBlurNatural) {

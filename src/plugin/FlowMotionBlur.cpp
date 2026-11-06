@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <filesystem>
 #include <fstream>
@@ -144,7 +145,7 @@ static inline A_u_short ToU16(float v)
 // Fuer Vektor-Ebenen (premultiply = false) werden die Rohwerte gelesen.
 static void ReadWorld(const PF_EffectWorld* w, PixKind kind, fmb::RGBAImage& out, bool straightAlpha, bool premultiply = true)
 {
-    out.resize(w->width, w->height);
+    out.ensure(w->width, w->height); // wird vollstaendig ueberschrieben
     const bool straight = premultiply && straightAlpha;
 
     fmb::ParallelFor(0, w->height, [&](int y0, int y1) {
@@ -593,71 +594,171 @@ static bool WritePGM(const std::filesystem::path& p, const fmb::Image& im)
     return static_cast<bool>(f);
 }
 
+// ---------------------------------------------------------------------------
+// Zustand je Effektinstanz (nur Premiere): Zwischenspeicher fuer Bilder,
+// Muster doppelter Bilder, Kamerabewegung des letzten Bildes.
+// ---------------------------------------------------------------------------
+struct InstanceState {
+    std::mutex m;
+    struct Entry {
+        A_long time = 0; int w = 0, h = 0, factor = 0; float alphaW = 0;
+        fmb::Image luma; double alpha = 0; uint64_t use = 0;
+    };
+    std::vector<Entry> frames;
+    uint64_t tick = 0;
+    int rep = 1; A_long repTime = 0;          // erkanntes Wiederholungsmuster
+    fmb::CameraPrior prior; A_long priorTime = 0; bool havePrior = false;
+    long hits = 0, misses = 0;
+
+    static constexpr size_t kMaxBytes = 192u << 20; // max. ~192 MB je Instanz
+
+    Entry* Find(A_long t, int w, int h, int factor, float aw)
+    {
+        for (Entry& e : frames)
+            if (e.time == t && e.w == w && e.h == h && e.factor == factor && e.alphaW == aw) { e.use = ++tick; return &e; }
+        return nullptr;
+    }
+    void Put(A_long t, int w, int h, int factor, float aw, const fmb::Image& luma, double alpha)
+    {
+        if (Entry* e = Find(t, w, h, factor, aw)) { e->luma = luma; e->alpha = alpha; return; }
+        Entry e; e.time = t; e.w = w; e.h = h; e.factor = factor; e.alphaW = aw; e.luma = luma; e.alpha = alpha; e.use = ++tick;
+        frames.push_back(std::move(e));
+        // aelteste Eintraege entfernen, bis das Budget passt (mind. 3 behalten)
+        auto bytes = [&] { size_t b = 0; for (auto& f : frames) b += f.luma.d.size() * sizeof(float); return b; };
+        while (frames.size() > 3 && bytes() > kMaxBytes) {
+            auto oldest = std::min_element(frames.begin(), frames.end(), [](const Entry& x, const Entry& y) { return x.use < y.use; });
+            frames.erase(oldest);
+        }
+        while (frames.size() > 16) {
+            auto oldest = std::min_element(frames.begin(), frames.end(), [](const Entry& x, const Entry& y) { return x.use < y.use; });
+            frames.erase(oldest);
+        }
+    }
+};
+
+static std::shared_ptr<InstanceState> GetInstanceState(A_long instanceId)
+{
+    if (instanceId == 0) return nullptr;
+    static std::mutex gm;
+    static std::map<A_long, std::shared_ptr<InstanceState>> states;
+    std::lock_guard<std::mutex> lock(gm);
+    auto& sp = states[instanceId];
+    if (!sp) sp = std::make_shared<InstanceState>();
+    return sp;
+}
+
 // Holt den Frame bei current_time + offset und berechnet den Fluss dorthin.
 // Gibt false zurueck, wenn kein brauchbarer Nachbarframe existiert (Clip-Anfang/-Ende).
 // computeFlow = false: nur die Luminanz des Nachbarframes liefern (nbLuma),
 // der Fluss wird dann gemeinsam fuer beide Richtungen berechnet (Kamera-Modus).
+// st (optional): Zwischenspeicher - schon bekannte Bilder werden nicht erneut
+// bei Premiere angefordert.
 static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImage& cur,
                           const fmb::Image& curLuma, int factor, const fmb::FlowParams& fp,
                           float alphaWeight, double curAlpha, const std::vector<fmb::Guide>& guides,
                           const Engine& eng, fmb::Flow& flow, PF_Err& err, NbInfo& info,
-                          bool computeFlow, fmb::Image& nbLuma)
+                          bool computeFlow, fmb::Image& nbLuma, InstanceState* st = nullptr)
 {
-    PF_ParamDef ck;
-    AEFX_CLR_STRUCT(ck);
-    err = PF_CHECKOUT_PARAM(in_data, FMB_INPUT, in_data->current_time + offset,
-                            in_data->time_step, in_data->time_scale, &ck);
-    if (err != PF_Err_NONE) {
-        info.status = "ABRUF FEHLGESCHLAGEN (CODE " + std::to_string(static_cast<int>(err)) + ")";
-        // Abbruch durch den Benutzer weitergeben, alles andere = kein Nachbarframe
-        if (err != PF_Interrupt_CANCEL) err = PF_Err_NONE;
-        return false;
-    }
+    const A_long t = in_data->current_time + offset;
+    double nbAlpha = 0;
+    std::string sizeNote;
+    bool have = false;
+    err = PF_Err_NONE;
 
-    bool ok = false;
-    PF_EffectWorld* w = &ck.u.ld;
-    if (!w->data || w->width <= 0 || w->height <= 0) {
-        info.status = "KEIN BILD GELIEFERT";
-    } else {
-        PixKind kind = GetPixKind(in_data, w);
-        if (kind == PixKind::Unknown) {
-            info.status = "FORMAT UNBEKANNT";
-        } else {
-            // Direkt als verkleinerte Luminanz einlesen (spart Speicher und Zeit)
-            double nbAlpha = 0;
-            std::string sizeNote;
-            if (w->width != cur.w || w->height != cur.h) {
-                // Premiere liefert Nachbarframes evtl. in Clip- statt Sequenzgroesse
-                sizeNote = " SKALIERT VON " + std::to_string(w->width) + "X" + std::to_string(w->height);
-                const int f2 = std::max(1, static_cast<int>(std::lround(factor * static_cast<double>(w->width) / cur.w)));
-                fmb::Image tmp;
-                ReadLumaWorld(w, kind, IsPremiere(in_data), f2, alphaWeight, tmp, nbAlpha);
-                ResizeLuma(tmp, curLuma.w, curLuma.h, nbLuma);
-            } else {
-                ReadLumaWorld(w, kind, IsPremiere(in_data), factor, alphaWeight, nbLuma, nbAlpha);
-            }
-            // Ausserhalb des Clips liefern Hosts oft ein leeres (transparentes) Bild.
-            if (curAlpha > 0.0 && nbAlpha <= 0.02 * curAlpha) {
-                info.status = "TRANSPARENT (AUSSERHALB DES CLIPS)" + sizeNote;
-            } else {
-                double d = 0;
-                for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
-                info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
-                if (computeFlow) {
-                    // Grobe Vorsuche: findet auch sehr grosse Bewegungen (Speed Ramps)
-                    fmb::FlowParams fp2 = fp;
-                    fmb::EstimateGlobalShift(curLuma, nbLuma, fp2.initU, fp2.initV);
-                    info.shift = std::hypot(fp2.initU, fp2.initV) * factor;
-                    eng.Flow(curLuma, nbLuma, fp2, guides.empty() ? nullptr : &guides, flow);
-                }
-                info.status = (info.diff < 1e-4 ? "OK, ABER GLEICHES BILD" : "OK") + sizeNote;
-                ok = true;
-            }
+    if (st) {
+        std::lock_guard<std::mutex> lock(st->m);
+        if (InstanceState::Entry* e = st->Find(t, cur.w, cur.h, factor, alphaWeight)) {
+            nbLuma = e->luma; nbAlpha = e->alpha; have = true; ++st->hits;
+            sizeNote = " (ZWISCHENSPEICHER)";
         }
     }
-    PF_CHECKIN_PARAM(in_data, &ck);
-    return ok;
+    if (!have) {
+        PF_ParamDef ck;
+        AEFX_CLR_STRUCT(ck);
+        err = PF_CHECKOUT_PARAM(in_data, FMB_INPUT, t, in_data->time_step, in_data->time_scale, &ck);
+        if (err != PF_Err_NONE) {
+            info.status = "ABRUF FEHLGESCHLAGEN (CODE " + std::to_string(static_cast<int>(err)) + ")";
+            // Abbruch durch den Benutzer weitergeben, alles andere = kein Nachbarframe
+            if (err != PF_Interrupt_CANCEL) err = PF_Err_NONE;
+            return false;
+        }
+        PF_EffectWorld* w = &ck.u.ld;
+        if (!w->data || w->width <= 0 || w->height <= 0) {
+            info.status = "KEIN BILD GELIEFERT";
+        } else {
+            PixKind kind = GetPixKind(in_data, w);
+            if (kind == PixKind::Unknown) {
+                info.status = "FORMAT UNBEKANNT";
+            } else {
+                // Direkt als verkleinerte Luminanz einlesen (spart Speicher und Zeit)
+                if (w->width != cur.w || w->height != cur.h) {
+                    // Premiere liefert Nachbarframes evtl. in Clip- statt Sequenzgroesse
+                    sizeNote = " SKALIERT VON " + std::to_string(w->width) + "X" + std::to_string(w->height);
+                    const int f2 = std::max(1, static_cast<int>(std::lround(factor * static_cast<double>(w->width) / cur.w)));
+                    fmb::Image tmp;
+                    ReadLumaWorld(w, kind, IsPremiere(in_data), f2, alphaWeight, tmp, nbAlpha);
+                    ResizeLuma(tmp, curLuma.w, curLuma.h, nbLuma);
+                } else {
+                    ReadLumaWorld(w, kind, IsPremiere(in_data), factor, alphaWeight, nbLuma, nbAlpha);
+                }
+                have = true;
+                if (st) {
+                    std::lock_guard<std::mutex> lock(st->m);
+                    st->Put(t, cur.w, cur.h, factor, alphaWeight, nbLuma, nbAlpha);
+                    ++st->misses;
+                }
+            }
+        }
+        PF_CHECKIN_PARAM(in_data, &ck);
+    }
+    if (!have) return false;
+
+    // Ausserhalb des Clips liefern Hosts oft ein leeres (transparentes) Bild.
+    if (curAlpha > 0.0 && nbAlpha <= 0.02 * curAlpha) {
+        info.status = "TRANSPARENT (AUSSERHALB DES CLIPS)" + sizeNote;
+        return false;
+    }
+    double d = 0;
+    for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
+    info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
+    if (computeFlow) {
+        // Grobe Vorsuche: findet auch sehr grosse Bewegungen (Speed Ramps)
+        fmb::FlowParams fp2 = fp;
+        fmb::EstimateGlobalShift(curLuma, nbLuma, fp2.initU, fp2.initV);
+        info.shift = std::hypot(fp2.initU, fp2.initV) * factor;
+        eng.Flow(curLuma, nbLuma, fp2, guides.empty() ? nullptr : &guides, flow);
+    }
+    info.status = (info.diff < 1e-4 ? "OK, ABER GLEICHES BILD" : "OK") + sizeNote;
+    return true;
 }
+
+// Wiederverwendbare grosse Bildpuffer: Bei 1512x2688 sind das je ~65 MB. Frischer
+// Speicher in dieser Groesse ist (gerade unter macOS) teuer, daher werden die
+// Puffer zwischen den Bildern aufbewahrt.
+struct BufferPool {
+    std::mutex m;
+    std::vector<std::vector<float>> free;
+    std::vector<float> Get(size_t n)
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (size_t i = 0; i < free.size(); ++i)
+            if (free[i].size() == n) { std::vector<float> v = std::move(free[i]); free.erase(free.begin() + i); return v; }
+        return std::vector<float>();
+    }
+    void Put(std::vector<float>&& v)
+    {
+        if (v.empty()) return;
+        std::lock_guard<std::mutex> lock(m);
+        if (free.size() < 6) free.push_back(std::move(v));
+    }
+};
+static BufferPool& Buffers() { static BufferPool* p = new BufferPool(); return *p; }
+
+// Gibt die Puffer der Bilder am Ende des Renderns an den Pool zurueck.
+struct PooledImages {
+    fmb::RGBAImage* a; fmb::RGBAImage* b;
+    ~PooledImages() { Buffers().Put(std::move(a->d)); Buffers().Put(std::move(b->d)); }
+};
 
 static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output)
 {
@@ -694,6 +795,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             tMark = now;
         };
         fmb::RGBAImage cur;
+        const size_t nPix = static_cast<size_t>(input->width) * input->height * 4;
+        cur.d = Buffers().Get(nPix);
         ReadWorld(input, inKind, cur, IsPremiere(in_data));
 
         fmb::BlurParams bp;
@@ -703,6 +806,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         bp.minMotion = static_cast<float>(params[FMB_MIN_MOTION]->u.fs_d.value / DownsampleX(in_data));
         bp.mode = (params[FMB_BLUR_MODE]->u.pd.value == MODE_OBJECTS) ? fmb::kBlurObjects : fmb::kBlurNatural;
         fmb::RGBAImage result;
+        result.d = Buffers().Get(nPix);
+        PooledImages pooled{ &cur, &result };
 
         // --- Variante 1: Vektoren aus einer Ebene -------------------------
         if (source == SOURCE_LAYER) {
@@ -776,8 +881,9 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         A_long timeOffset = 0;
         double selfDiff = -1.0;
         std::string offsetNote = "0";
+        A_long instanceId = 0;
         if (IsPremiere(in_data)) {
-            A_long instanceId = 0, trackStart = 0, clipStart = 0;
+            A_long trackStart = 0, clipStart = 0;
             {
                 Suite<PF_UtilitySuite> us(in_data, kPFUtilitySuite, kPFUtilitySuiteVersion2);
                 if (us) {
@@ -827,6 +933,25 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                          "  EBENENSTART " + std::to_string(trackStart) + "  CLIPSTART " + std::to_string(clipStart);
         }
 
+        // Zustand dieser Effektinstanz (Zwischenspeicher, Muster, letzte Kamerabewegung)
+        std::shared_ptr<InstanceState> state = GetInstanceState(instanceId);
+        bool cacheFlushed = false;
+        if (state) {
+            // Aktuelles Bild merken - es ist beim naechsten Bild der Nachbar. Liegt fuer
+            // diesen Zeitpunkt schon ein anderes Bild vor, hat sich der Inhalt geaendert
+            // (z. B. Farbkorrektur darunter): dann den Zwischenspeicher leeren.
+            std::lock_guard<std::mutex> lock(state->m);
+            const A_long tNow = in_data->current_time + timeOffset;
+            if (InstanceState::Entry* e = state->Find(tNow, cur.w, cur.h, factor, alphaWeight)) {
+                double dd = 0;
+                if (e->luma.d.size() == curLuma.d.size())
+                    for (size_t i = 0; i < curLuma.d.size(); i += 7) dd += std::fabs(e->luma.d[i] - curLuma.d[i]);
+                dd /= std::max<size_t>(1, curLuma.d.size() / 7);
+                if (dd > 0.003) { state->frames.clear(); state->havePrior = false; cacheFlushed = true; }
+            }
+            state->Put(tNow, cur.w, cur.h, factor, alphaWeight, curLuma, curAlpha);
+        }
+
         const std::vector<fmb::Guide> gF = CollectGuides(in_data, params, +step, factor);
         const std::vector<fmb::Guide> gB = CollectGuides(in_data, params, -step, factor);
 
@@ -847,17 +972,26 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         const double kDup = 0.0025; // mittlerer Helligkeitsunterschied unter 0.25 % = gleiches Bild
         int kF = 1, kB = 1;
         bool haveF = false, haveB = false;
-        for (int k = 1; k <= 4; ++k) {
+        // Bekanntes Wiederholungsmuster vom letzten Bild: gleich beim richtigen
+        // Abstand anfangen (spart einen Bildabruf). Alle 8 Bilder neu pruefen.
+        int kStart = 1;
+        if (state) {
+            std::lock_guard<std::mutex> lock(state->m);
+            const A_long frameIdx = step ? in_data->current_time / step : 0;
+            if (state->rep > 1 && state->rep <= 4 && std::labs(in_data->current_time - state->repTime) <= 4 * step && (frameIdx % 8) != 0)
+                kStart = state->rep;
+        }
+        for (int k = kStart; k <= 4; ++k) {
             NbInfo tmp;
-            haveF = NeighbourFlow(in_data, timeOffset + dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
+            haveF = NeighbourFlow(in_data, timeOffset + dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF, state.get());
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoF = tmp; kF = k;
             if (!haveF || tmp.diff >= kDup) break;
         }
-        for (int k = 1; k <= 4; ++k) {
+        for (int k = kStart; k <= 4; ++k) {
             NbInfo tmp;
-            haveB = NeighbourFlow(in_data, timeOffset - dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
+            haveB = NeighbourFlow(in_data, timeOffset - dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB, state.get());
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoB = tmp; kB = k;
@@ -869,6 +1003,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         // AABBCC), enthaelt auch der direkt benachbarte andere Frame die Bewegung
         // von r Bildern. Daher beide Richtungen durch denselben Faktor teilen.
         const int rep = std::max(kF, kB);
+        if (state) { std::lock_guard<std::mutex> lock(state->m); state->rep = rep; state->repTime = in_data->current_time; }
 
         // Plausibilitaet der Nachbarbilder: Bei Zeitverzerrung (Speed Ramp,
         // Zeit-Neuzuordnung) liefert Premiere Nachbarbilder aus der unverzerrten
@@ -904,12 +1039,28 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             // Kamerabewegung direkt aus den Bildern, feines Tracking ab diesem
             // Modell, Auswahl je Bildstelle (Modell / Tracking / keine Bewegung).
             fmb::CameraInfo ci;
+            // Kamerabewegung des vorherigen Bildes als Startwert (falls nah genug)
+            fmb::CameraPrior prior; bool usePrior = false;
+            if (state) {
+                std::lock_guard<std::mutex> lock(state->m);
+                if (state->havePrior && std::labs(in_data->current_time - state->priorTime) <= 3 * step * rep) {
+                    prior = state->prior; usePrior = true;
+                }
+            }
             fmb::CameraFlows(curLuma, haveF ? &lumF : nullptr, haveB ? &lumB : nullptr, fp,
                              [&](const fmb::Image& a, const fmb::Image& b, const fmb::FlowParams& q, fmb::Flow& o) {
                                  eng.Flow(a, b, q, nullptr, o);
                              },
-                             haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci);
+                             haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci,
+                             usePrior ? &prior : nullptr);
             camInfo = ci;
+            if (state) {
+                // Kamerabewegung fuer das naechste Bild merken
+                std::lock_guard<std::mutex> lock(state->m);
+                state->prior.validF = ci.modelF; state->prior.validB = ci.modelB;
+                std::copy(ci.Hf, ci.Hf + 9, state->prior.Hf); std::copy(ci.Hb, ci.Hb + 9, state->prior.Hb);
+                state->priorTime = in_data->current_time; state->havePrior = ci.modelF || ci.modelB;
+            }
             if (haveF) scaleFlow(fwd, rep);
             if (haveB) scaleFlow(bwd, rep);
             const bool okAll = (!haveF || ci.modelF) && (!haveB || ci.modelB);
@@ -962,6 +1113,14 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                         (selfDiff > 0.01 ? "  -> ZEITBASIS ABWEICHEND" : ""));
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
             L.push_back("KAMERA: " + modelState);
+            if (cameraMode)
+                L.push_back(std::string("STARTWERT VOM LETZTEN BILD: ") + (camInfo.priorUsedF || camInfo.priorUsedB ? "JA" : "NEIN") +
+                            "  VERDECKUNG " + Num(camInfo.occluded * 100, 1) + "%");
+            if (state) {
+                std::lock_guard<std::mutex> lock(state->m);
+                L.push_back("ZWISCHENSPEICHER: " + std::to_string(state->frames.size()) + " BILDER  TREFFER " +
+                            std::to_string(state->hits) + "  ABRUFE " + std::to_string(state->misses) + (cacheFlushed ? "  (GELEERT)" : ""));
+            }
             L.push_back("VORWAERTS: " + infoF.status + (kF > 1 ? "  (" + std::to_string(kF) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
             L.push_back("RUECKWAERTS: " + infoB.status + (kB > 1 ? "  (" + std::to_string(kB) + " BILDER WEITER, DOPPELTE BILDER)" : ""));

@@ -41,6 +41,13 @@ struct RGBAImage {
         w = width; h = height;
         d.assign(static_cast<size_t>(w) * h * 4, 0.f);
     }
+    // Wie resize, aber ohne Nullsetzen, wenn die Groesse schon passt (der Inhalt
+    // wird anschliessend vollstaendig ueberschrieben). Spart Zeit bei grossen Bildern.
+    void ensure(int width, int height) {
+        w = width; h = height;
+        const size_t n = static_cast<size_t>(w) * h * 4;
+        if (d.size() != n) d.resize(n);
+    }
     float*       px(int x, int y)       { return d.data() + (static_cast<size_t>(y) * w + x) * 4; }
     const float* px(int x, int y) const { return d.data() + (static_cast<size_t>(y) * w + x) * 4; }
 };
@@ -69,6 +76,8 @@ struct FlowParams {
     float initU          = 0.f;    // Startwert der Bewegung (globale Verschiebung, px von I0)
     float initV          = 0.f;
     const struct Flow* initFlow = nullptr; // optional: Startfeld (Groesse wie I0), ersetzt initU/V
+    bool  occlusions     = true;   // Kamera-Ablauf: Verdeckungen korrigieren (ResolveOcclusions)
+    bool  localHalf      = true;   // Kamera-Ablauf: feines Tracking + Auffuellen in halber Aufloesung
 };
 
 // Art der Unschaerfe
@@ -150,12 +159,33 @@ struct CameraInfo {
     float shiftFx = 0, shiftFy = 0, shiftBx = 0, shiftBy = 0;
     double costF = 0, costB = 0, zeroF = 0, zeroB = 0;
     const char* whyF = "-"; const char* whyB = "-";
+    bool priorUsedF = false, priorUsedB = false; // Startwert vom vorherigen Bild genutzt
+    float occluded = 0;                          // Anteil korrigierter Verdeckungen
     double Hf[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Hb[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
     SelectStats sel;
 };
 using FlowFn = std::function<void(const Image&, const Image&, const FlowParams&, Flow&)>;
+
+// Kamerabewegung des vorherigen Bildes als Startwert: Die Kamera bewegt sich von
+// Bild zu Bild kaum anders. Passt der Startwert, entfaellt die aufwendige Suche
+// ueber viele Ausgangslagen (schneller, ruhiger).
+struct CameraPrior {
+    bool validF = false, validB = false;
+    double Hf[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Hb[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+};
+
 void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowParams& p,
-                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info = nullptr);
+                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info = nullptr,
+                 const CameraPrior* prior = nullptr);
+
+// Verdeckungen: Wird eine Stelle im naechsten (oder vorherigen) Bild verdeckt bzw.
+// erst freigelegt, ist eine der beiden Richtungen falsch. Wo vorwaerts und
+// rueckwaerts nicht zusammenpassen, wird nur die Richtung verwendet, die besser zu
+// den Bildern passt (die andere wird als Spiegelbild gesetzt).
+// Rueckgabe: Anteil der korrigierten Stellen.
+// mf/mb (optional): Kameramodell; dessen eigene Asymmetrie (Perspektive) gilt nicht als Verdeckung.
+float ResolveOcclusions(const Image& I0, const Image& In, const Image& Ip, Flow& fwd, Flow& bwd,
+                        const Flow* mf = nullptr, const Flow* mb = nullptr);
 
 // Kameramodell: Bei Kamerabewegung (Drohne, Schwenk, Fahrt) folgt die Bewegung
 // im ganzen Bild einer perspektivischen Abbildung (Homographie). Diese wird

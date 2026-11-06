@@ -31,6 +31,8 @@ endif()
 # --- Test (laeuft ueberall, auch ohne SDK) ---------------------------------
 add_executable(fmb_test tests/test_core.cpp)
 target_link_libraries(fmb_test PRIVATE fmb_core)
+add_executable(fmb_test_occlusion tests/test_occlusion.cpp)
+target_link_libraries(fmb_test_occlusion PRIVATE fmb_core)
 add_executable(fmb_test_drone tests/test_drone.cpp)
 target_link_libraries(fmb_test_drone PRIVATE fmb_core)
 

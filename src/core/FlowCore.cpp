@@ -756,7 +756,7 @@ void ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
                      int flowScale, const BlurParams& p, RGBAImage& dst)
 {
     const int W = src.w, H = src.h;
-    dst.resize(W, H);
+    dst.ensure(W, H); // alle Pixel werden geschrieben
     if (fwd && fwd->empty()) fwd = nullptr;
     if (bwd && bwd->empty()) bwd = nullptr;
     if ((!fwd && !bwd) || p.shutter <= 0.f || W <= 0 || H <= 0) {
@@ -1329,8 +1329,26 @@ void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
 }
 
 
+// Startwert vom vorherigen Bild: auf den drei feinsten Stufen verfeinern. Gilt als
+// gut, wenn der Restfehler deutlich unter dem von "keine Bewegung" liegt.
+static bool TryPrior(const AlignPyr& A, const AlignPyr& B, const double* Hp, double zeroCost,
+                     double H[9], double& cost)
+{
+    if (!Hp || std::fabs(Hp[8]) < 1e-12) return false;
+    double h[8]; for (int k = 0; k < 8; ++k) h[k] = Hp[k] / Hp[8];
+    if (!PlausibleH(h)) return false;
+    const int coarsest = static_cast<int>(A.P.size()) - 1;
+    double c = 1e9;
+    for (int L = std::min(coarsest, A.finest + 2); L >= A.finest; --L)
+        c = OptimizeLevel(A.P[L], B.P[L], B.Gx[L], B.Gy[L], h, 20);
+    if (c >= 1e8 || c > 0.6 * zeroCost) return false;
+    for (int k = 0; k < 8; ++k) H[k] = h[k];
+    H[8] = 1.0; cost = c;
+    return true;
+}
+
 void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowParams& p,
-                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info)
+                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info, const CameraPrior* prior)
 {
     CameraInfo ci;
     Flow mf, mb;
@@ -1343,12 +1361,21 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
     BuildAlignPyr(I0, P0);
     if (useF) BuildAlignPyr(*In, PN);
     if (useB) BuildAlignPyr(*Ip, PP);
-    if (useF) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignPyrH(P0, PN, fdx, fdy, Hf, &ci.resF, nullptr); ci.whyF = ci.modelF ? "OK" : "SCHAETZUNG GESCHEITERT"; }
-    if (useB) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignPyrH(P0, PP, bdx, bdy, Hb, &ci.resB, nullptr); ci.whyB = ci.modelB ? "OK" : "SCHAETZUNG GESCHEITERT"; }
-    ci.shiftFx = fdx; ci.shiftFy = fdy; ci.shiftBx = bdx; ci.shiftBy = bdy;
     const double Hid[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
     const double zeroF = useF ? CostPyr(P0, PN, Hid) : 0;
     const double zeroB = useB ? CostPyr(P0, PP, Hid) : 0;
+    // 1. Versuch: Startwert vom vorherigen Bild (schnell). Sonst volle Suche.
+    if (useF && prior && prior->validF && TryPrior(P0, PN, prior->Hf, zeroF, Hf, ci.resF)) {
+        ci.modelF = true; ci.priorUsedF = true; ci.whyF = "OK";
+    } else if (useF) {
+        EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignPyrH(P0, PN, fdx, fdy, Hf, &ci.resF, nullptr); ci.whyF = ci.modelF ? "OK" : "SCHAETZUNG GESCHEITERT";
+    }
+    if (useB && prior && prior->validB && TryPrior(P0, PP, prior->Hb, zeroB, Hb, ci.resB)) {
+        ci.modelB = true; ci.priorUsedB = true; ci.whyB = "OK";
+    } else if (useB) {
+        EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignPyrH(P0, PP, bdx, bdy, Hb, &ci.resB, nullptr); ci.whyB = ci.modelB ? "OK" : "SCHAETZUNG GESCHEITERT";
+    }
+    ci.shiftFx = fdx; ci.shiftFy = fdy; ci.shiftBx = bdx; ci.shiftBy = bdy;
     // Gegenrichtung als Pruefung: rueckwaerts ~ Umkehrung von vorwaerts. Nur
     // verfeinern, wenn die Umkehrung besser passt als die eigene Schaetzung
     // (hilft bei grossen Bewegungen, wo eine Richtung viel Inhalt verliert).
@@ -1375,25 +1402,111 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
                      if (ci.costF >= zeroF) { ci.modelF = false; ci.whyF = "SCHLECHTER ALS RUHE"; } }
     if (ci.modelB) { ci.costB = CostPyr(P0, PP, Hb); ci.whyB = "OK"; std::copy(Hb, Hb + 9, ci.Hb);
                      if (ci.costB >= zeroB) { ci.modelB = false; ci.whyB = "SCHLECHTER ALS RUHE"; } }
-    auto track = [&](const Image* In1, Flow* out, Flow& model, bool ok, const double* Hm, float dx, float dy) {
-        if (!In1 || !out) return;
+    // Feines Tracking (Parallaxe) startet am Kameramodell. Es liefert nur noch
+    // kleine Korrekturen und laeuft daher - samt Auffuellen - in halber
+    // Aufloesung; das Kameramodell selbst bleibt in voller Genauigkeit.
+    const bool half = p.localHalf && std::min(I0.w, I0.h) >= 200;
+    Image I0h, Inh, Iph;
+    if (half) {
+        Downscale(I0, 2, I0h);
+        if (useF) Downscale(*In, 2, Inh);
+        if (useB) Downscale(*Ip, 2, Iph);
+    }
+    const Image& L0 = half ? I0h : I0;
+    auto upsample = [&](const Flow& src, Flow& dst) {
+        dst.u.resize(I0.w, I0.h); dst.v.resize(I0.w, I0.h);
+        const float sx = static_cast<float>(src.w()) / I0.w, sy = static_cast<float>(src.h()) / I0.h;
+        ParallelFor(0, I0.h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < I0.w; ++x) {
+                    float fx = (x + 0.5f) * sx - 0.5f, fy = (y + 0.5f) * sy - 0.5f;
+                    dst.u.row(y)[x] = Sample(src.u, fx, fy) / sx;
+                    dst.v.row(y)[x] = Sample(src.v, fx, fy) / sy;
+                }
+        });
+    };
+    Flow lf, lb, modelLF, modelLB;
+    auto track = [&](const Image& In1, Flow& out, Flow& model, Flow& modelL, bool ok, const double* Hm, float dx, float dy) {
         FlowParams q = p;
         if (ok) {
-            HomographyField(Hm, I0.w, I0.h, model); q.initFlow = &model;
+            HomographyField(Hm, I0.w, I0.h, model);
+            HomographyField(Hm, L0.w, L0.h, modelL); // gleiche normierte Koordinaten
+            q.initFlow = &modelL;
             // Startet am Kameramodell: nur noch kleine Abweichungen (Parallaxe)
             // -> wenige Pyramidenstufen genuegen, spart viel Rechenzeit.
             q.maxLevels = std::min(q.maxLevels, 3);
             q.iterations = std::min(q.iterations, 3);
+        } else {
+            const float k = static_cast<float>(L0.w) / I0.w;
+            q.initU = dx * k; q.initV = dy * k;
         }
-        else    { q.initU = dx; q.initV = dy; }
-        flowFn(I0, *In1, q, *out);
+        flowFn(L0, In1, q, out);
     };
-    track(In, fwd, mf, ci.modelF, Hf, fdx, fdy);
-    track(Ip, bwd, mb, ci.modelB, Hb, bdx, bdy);
-    RefineFlows(I0, In ? fwd : nullptr, Ip ? bwd : nullptr);
+    if (useF) track(half ? Inh : *In, lf, mf, modelLF, ci.modelF, Hf, fdx, fdy);
+    if (useB) track(half ? Iph : *Ip, lb, mb, modelLB, ci.modelB, Hb, bdx, bdy);
+    RefineFlows(L0, useF ? &lf : nullptr, useB ? &lb : nullptr);
+    if (useF) { if (half) upsample(lf, *fwd); else *fwd = lf; }
+    if (useB) { if (half) upsample(lb, *bwd); else *bwd = lb; }
     SelectCandidates(I0, In, Ip, In ? fwd : nullptr, Ip ? bwd : nullptr,
                      ci.modelF ? &mf : nullptr, ci.modelB ? &mb : nullptr, &ci.sel);
+    if (useF && useB && p.occlusions) ci.occluded = ResolveOcclusions(I0, *In, *Ip, *fwd, *bwd,
+                                                      ci.modelF && ci.modelB ? &mf : nullptr, ci.modelF && ci.modelB ? &mb : nullptr);
     if (info) *info = ci;
+}
+
+
+float ResolveOcclusions(const Image& I0, const Image& In, const Image& Ip, Flow& fwd, Flow& bwd,
+                        const Flow* mf, const Flow* mb)
+{
+    const int w = I0.w, h = I0.h;
+    if (fwd.w() != w || bwd.w() != w || fwd.h() != h || bwd.h() != h || In.w != w || Ip.w != w) return 0.f;
+    // Fotometrischer Fehler je Richtung (leicht geglaettet)
+    Image eF, eB; eF.resize(w, h); eB.resize(w, h);
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float c0 = I0.row(y)[x];
+                float tx = x + fwd.u.row(y)[x], ty = y + fwd.v.row(y)[x];
+                // Ziel ausserhalb des Bildes: Inhalt verlaesst das Bild, keine Verdeckung (-1 = ungueltig)
+                eF.row(y)[x] = (tx < 0 || ty < 0 || tx > w - 1 || ty > h - 1) ? -1.f : std::fabs(Sample(In, tx, ty) - c0);
+                tx = x + bwd.u.row(y)[x]; ty = y + bwd.v.row(y)[x];
+                eB.row(y)[x] = (tx < 0 || ty < 0 || tx > w - 1 || ty > h - 1) ? -1.f : std::fabs(Sample(Ip, tx, ty) - c0);
+            }
+    });
+    Image sF, sB;
+    { Image a = eF, b = eB; for (float& v : a.d) v = std::max(v, 0.f); for (float& v : b.d) v = std::max(v, 0.f);
+      BoxFilter(a, 2, sF); BoxFilter(b, 2, sB); }
+    std::vector<int> rowCount(h, 0);
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float fu = fwd.u.row(y)[x], fv = fwd.v.row(y)[x];
+                const float bu = bwd.u.row(y)[x], bv = bwd.v.row(y)[x];
+                if (eF.row(y)[x] < 0.f || eB.row(y)[x] < 0.f) continue; // Inhalt verlaesst das Bild
+                const float e = std::hypot(fu + bu, fv + bv);
+                const float m = 0.5f * (std::hypot(fu, fv) + std::hypot(bu, bv));
+                // vom Kameramodell erwartete Asymmetrie (Perspektive) abziehen
+                float eModel = 0.f;
+                if (mf && mb) eModel = std::hypot(mf->u.row(y)[x] + mb->u.row(y)[x], mf->v.row(y)[x] + mb->v.row(y)[x]);
+                if (e <= eModel + std::max(1.0f, 0.3f * m)) continue; // passt zusammen
+                const float a = sF.row(y)[x], b = sB.row(y)[x];
+                if (std::fabs(a - b) < 0.01f) continue;          // keine Richtung klar besser
+                // Die schlechtere Richtung durch das Spiegelbild der besseren ersetzen;
+                // mit Kameramodell dessen Asymmetrie beibehalten.
+                if (a < b) {
+                    float ou = (mf && mb) ? (mf->u.row(y)[x] + mb->u.row(y)[x]) : 0.f;
+                    float ov = (mf && mb) ? (mf->v.row(y)[x] + mb->v.row(y)[x]) : 0.f;
+                    bwd.u.row(y)[x] = -fu + ou; bwd.v.row(y)[x] = -fv + ov;
+                } else {
+                    float ou = (mf && mb) ? (mf->u.row(y)[x] + mb->u.row(y)[x]) : 0.f;
+                    float ov = (mf && mb) ? (mf->v.row(y)[x] + mb->v.row(y)[x]) : 0.f;
+                    fwd.u.row(y)[x] = -bu + ou; fwd.v.row(y)[x] = -bv + ov;
+                }
+                ++rowCount[y];
+            }
+    });
+    long n = 0; for (int c : rowCount) n += c;
+    return static_cast<float>(n) / std::max(1L, static_cast<long>(w) * h);
 }
 
 } // namespace fmb
