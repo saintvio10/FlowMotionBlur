@@ -611,7 +611,7 @@ struct InstanceState {
     uint64_t tick = 0;
     int rep = 1; A_long repTime = 0;          // erkanntes Wiederholungsmuster
     fmb::CameraPrior prior; A_long priorTime = 0; bool havePrior = false;
-    long hits = 0, misses = 0;
+    long hits = 0, misses = 0, flushes = 0;
 
     static constexpr size_t kMaxBytes = 192u << 20; // max. ~192 MB je Instanz
 
@@ -950,7 +950,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                 if (e->luma.d.size() == curLuma.d.size())
                     for (size_t i = 0; i < curLuma.d.size(); i += 7) dd += std::fabs(e->luma.d[i] - curLuma.d[i]);
                 dd /= std::max<size_t>(1, curLuma.d.size() / 7);
-                if (dd > 0.003) { state->frames.clear(); state->havePrior = false; cacheFlushed = true; }
+                if (dd > 0.003) { state->frames.clear(); state->havePrior = false; cacheFlushed = true; ++state->flushes; }
             }
             state->Put(tNow, cur.w, cur.h, factor, alphaWeight, curLuma, curAlpha);
         }
@@ -1122,7 +1122,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             if (state) {
                 std::lock_guard<std::mutex> lock(state->m);
                 L.push_back("ZWISCHENSPEICHER: " + std::to_string(state->frames.size()) + " BILDER  TREFFER " +
-                            std::to_string(state->hits) + "  ABRUFE " + std::to_string(state->misses) + (cacheFlushed ? "  (GELEERT)" : ""));
+                            std::to_string(state->hits) + "  ABRUFE " + std::to_string(state->misses) + "  GELEERT " + std::to_string(state->flushes) + (cacheFlushed ? " (JETZT)" : ""));
             }
             L.push_back("VORWAERTS: " + infoF.status + (kF > 1 ? "  (" + std::to_string(kF) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
@@ -1133,9 +1133,9 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                 // Statusdatei des Premiere-GPU-Wegs (PrGpuFilter.cpp)
                 std::ifstream gs(DiagDir().parent_path() / "premiere_gpu.txt");
                 std::string a, b;
-                if (gs && std::getline(gs, a) && std::getline(gs, b)) {
+                if (gs && std::getline(gs, a)) {
                     L.push_back("PREMIERE-GPU " + a);
-                    L.push_back("  LETZTES GPU-" + b);
+                    while (std::getline(gs, b)) L.push_back("  " + b);
                 } else {
 #if defined(_WIN32)
                     L.push_back("PREMIERE-GPU: NUR AUF DEM MAC");

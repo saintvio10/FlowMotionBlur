@@ -52,25 +52,34 @@ std::filesystem::path StatusFile()
 
 std::mutex gStatusMutex;
 std::string gStatusInit = "-", gStatusRender = "-";
+long gInstOk = 0, gInstNo = 0, gRenders = 0, gRendersOk = 0, gRendersFail = 0;
+std::string gLastFail = "-";
 
+// Zeile 1: Starts (aktiv/abgelehnt, letzter Grund). Zeile 2: Bilder und letztes Ergebnis.
 void WriteStatus()
 {
     try {
         const auto p = StatusFile();
         std::filesystem::create_directories(p.parent_path());
         std::ofstream f(p);
-        f << "START " << gStatusInit << "\n" << "BILD " << gStatusRender << "\n";
+        f << "STARTS: AKTIV " << gInstOk << "  ABGELEHNT " << gInstNo << "  ZULETZT: " << gStatusInit << "\n"
+          << "BILDER: " << gRenders << "  OK " << gRendersOk << "  FEHLER " << gRendersFail
+          << (gRendersFail ? "  LETZTER FEHLER: " + gLastFail : std::string()) << "\n"
+          << "LETZTES: " << gStatusRender << "\n";
     } catch (...) {}
 }
-void SetInitStatus(const std::string& s)
+void SetInitStatus(const std::string& s, bool ok = false)
 {
     std::lock_guard<std::mutex> l(gStatusMutex);
-    if (s == gStatusInit) return;
+    (ok ? gInstOk : gInstNo)++;
     gStatusInit = s; WriteStatus();
 }
-void SetRenderStatus(const std::string& s)
+// Wird am Ende jedes Render-Aufrufs gesetzt (Erfolg oder Grund des Abbruchs)
+void SetRenderStatus(const std::string& s, bool fail = false)
 {
     std::lock_guard<std::mutex> l(gStatusMutex);
+    ++gRenders;
+    if (fail) { ++gRendersFail; gLastFail = s; } else ++gRendersOk;
     gStatusRender = s; WriteStatus();
 }
 
@@ -136,34 +145,34 @@ public:
             sp->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, (const void**)&mPPix) != kSPNoError ||
             sp->AcquireSuite(kPrSDKVideoSegmentSuite, kPrSDKVideoSegmentSuiteVersion, (const void**)&mSegment) != kSPNoError ||
             !mDevice || !mPPix || !mSegment) {
-            SetInitStatus("SUITES FEHLEN -> SOFTWARE");
+            SetInitStatus("SUITES FEHLEN, SOFTWARE");
             return suiteError_Fail;
         }
         mDeviceIndex = inst->inDeviceIndex;
         PrGPUDeviceInfo info = {};
         if (mDevice->GetDeviceInfo(kPrSDKGPUDeviceSuiteVersion, mDeviceIndex, &info) != suiteError_NoError) {
-            SetInitStatus("GERAET UNBEKANNT -> SOFTWARE");
+            SetInitStatus("GERAET UNBEKANNT, SOFTWARE");
             return suiteError_Fail;
         }
         if (info.outDeviceFramework != PrGPUDeviceFramework_Metal) {
-            SetInitStatus("PREMIERE NUTZT KEIN METAL (OPENCL/CUDA) -> SOFTWARE");
+            SetInitStatus("PREMIERE NUTZT KEIN METAL (OPENCL/CUDA), SOFTWARE");
             return suiteError_Fail;
         }
         mMtlDevice = info.outDeviceHandle;
         mMtlQueue = info.outCommandQueueHandle;
-        if (!mMtlDevice || !mMtlQueue) { SetInitStatus("KEIN METAL-GERAET -> SOFTWARE"); return suiteError_Fail; }
+        if (!mMtlDevice || !mMtlQueue) { SetInitStatus("KEIN METAL-GERAET, SOFTWARE"); return suiteError_Fail; }
 
         // Nur der einfache, haeufige Fall laeuft auf Premieres GPU-Weg.
         const PrTime t0 = 0;
-        if (Num0(FMB_PR_GPU, t0) == 0) { SetInitStatus("OPTION AUS -> SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_VIEW, t0) != VIEW_RESULT) { SetInitStatus("ANSICHT NICHT ERGEBNIS -> SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_BLUR_MODE, t0) != MODE_NATURAL) { SetInitStatus("MODUS OBJEKTE -> SOFTWARE"); return suiteError_Fail; }
-        if (Pop(FMB_VECTOR_SOURCE, t0) != SOURCE_TRACKING) { SetInitStatus("VEKTOR-EBENE -> SOFTWARE"); return suiteError_Fail; }
+        if (Num0(FMB_PR_GPU, t0) == 0) { SetInitStatus("OPTION AUS, SOFTWARE"); return suiteError_Fail; }
+        if (Pop(FMB_VIEW, t0) != VIEW_RESULT) { SetInitStatus("ANSICHT NICHT ERGEBNIS, SOFTWARE"); return suiteError_Fail; }
+        if (Pop(FMB_BLUR_MODE, t0) != MODE_NATURAL) { SetInitStatus("MODUS OBJEKTE, SOFTWARE"); return suiteError_Fail; }
+        if (Pop(FMB_VECTOR_SOURCE, t0) != SOURCE_TRACKING) { SetInitStatus("VEKTOR-EBENE, SOFTWARE"); return suiteError_Fail; }
         for (int i = 0; i < FMB_NUM_TRACK_POINTS; ++i) {
             PrParam p = Get(FMB_TP_ON(i), t0);
-            if (p.mType != kPrParamType_Bool || p.mBool) { SetInitStatus("TRACK POINT AKTIV -> SOFTWARE"); return suiteError_Fail; }
+            if (p.mType != kPrParamType_Bool || p.mBool) { SetInitStatus("TRACK POINT AKTIV, SOFTWARE"); return suiteError_Fail; }
         }
-        SetInitStatus("AKTIV (METAL)");
+        SetInitStatus("AKTIV (METAL)", true);
         return suiteError_NoError;
     }
 
@@ -185,7 +194,7 @@ public:
         try {
             return RenderImpl(rp, inFrames, inFrameCount, outFrame);
         } catch (...) {
-            SetRenderStatus("FEHLER (AUSNAHME)");
+            SetRenderStatus("AUSNAHME", true);
             return suiteError_Fail;
         }
     }
@@ -234,7 +243,7 @@ private:
     {
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
-        if (!inFrames || inFrameCount < 1 || !outFrame) return suiteError_Fail;
+        if (!inFrames || inFrameCount < 1 || !outFrame) { SetRenderStatus("KEINE EINGABE", true); return suiteError_Fail; }
 
         const PrTime ct = rp->inClipTime;
         const float amount = static_cast<float>(Num0(FMB_AMOUNT, ct));
@@ -250,21 +259,24 @@ private:
         // das aktuelle Bild. Fehlt es, eine Kopie des Eingabebildes anlegen.
         fmb::metal::Frame cur;
         PrPixelFormat fmt = PrPixelFormat_Invalid;
-        if (!FrameOf(inFrames[0], cur, fmt)) { SetRenderStatus("FORMAT NICHT UNTERSTUETZT"); return suiteError_Fail; }
+        if (!FrameOf(inFrames[0], cur, fmt)) { SetRenderStatus("FORMAT NICHT UNTERSTUETZT", true); return suiteError_Fail; }
         if (!*outFrame) {
             csSDK_uint32 parN = 1, parD = 1;
             mPPix->GetPixelAspectRatio(inFrames[0], &parN, &parD);
-            if (mDevice->CreateGPUPPix(mDeviceIndex, fmt, cur.w, cur.h, parN, parD, prFieldsNone, outFrame) != suiteError_NoError)
-                return suiteError_Fail;
+            if (mDevice->CreateGPUPPix(mDeviceIndex, fmt, cur.w, cur.h, parN, parD, prFieldsNone, outFrame) != suiteError_NoError) {
+                SetRenderStatus("AUSGABE ANLEGEN", true); return suiteError_Fail;
+            }
             fmb::metal::Frame o; PrPixelFormat f2 = PrPixelFormat_Invalid;
-            if (!FrameOf(*outFrame, o, f2) || !fmb::metal::Copy(mMtlDevice, mMtlQueue, cur, o)) return suiteError_Fail;
+            if (!FrameOf(*outFrame, o, f2) || !fmb::metal::Copy(mMtlDevice, mMtlQueue, cur, o)) {
+                SetRenderStatus("AUSGABE KOPIEREN", true); return suiteError_Fail;
+            }
         }
         fmb::metal::Frame out;
         PrPixelFormat outFmt = PrPixelFormat_Invalid;
         if (!FrameOf(*outFrame, out, outFmt) || out.w != cur.w || out.h != cur.h) {
-            SetRenderStatus("AUSGABE UNPASSEND"); return suiteError_Fail;
+            SetRenderStatus("AUSGABE UNPASSEND", true); return suiteError_Fail;
         }
-        if (amount <= 0.f) return suiteError_NoError;
+        if (amount <= 0.f) { SetRenderStatus("STAERKE 0"); return suiteError_NoError; }
 
         // Vorschau-Verkleinerung (Premiere gibt 0.5 oder 2 an - beides zulassen)
         double ds = rp->inDownsampleFactorX;
@@ -288,7 +300,7 @@ private:
         fmb::Image curLuma;
         double curAlpha = 0;
         if (!fmb::metal::Luma(mMtlDevice, mMtlQueue, cur, factor, alphaWeight, curLuma, curAlpha)) {
-            SetRenderStatus("METAL: " + fmb::metal::LastError()); return suiteError_Fail;
+            SetRenderStatus("METAL: " + fmb::metal::LastError(), true); return suiteError_Fail;
         }
         struct Nb { bool have = false; fmb::Image luma; double diff = 1; };
         Nb nb[4];
@@ -382,15 +394,15 @@ private:
 
         if (!fmb::metal::BlurNaturalInPlace(mMtlDevice, mMtlQueue, out, pF ? &fwd : nullptr, pB ? &bwd : nullptr,
                                        factor, bp)) {
-            SetRenderStatus("METAL: " + fmb::metal::LastError()); return suiteError_Fail;
+            SetRenderStatus("METAL: " + fmb::metal::LastError(), true); return suiteError_Fail;
         }
         const auto tEnd = Clock::now();
         auto ms = [](Clock::time_point a, Clock::time_point b) {
             return std::to_string(static_cast<int>(std::chrono::duration<double, std::milli>(b - a).count()));
         };
         SetRenderStatus(std::to_string(cur.w) + "X" + std::to_string(cur.h) + (cur.isHalf ? " 16F" : " 32F") +
-                        "  " + what + (rep > 1 ? "  DOPPELTE BILDER" : "") +
-                        "  MS: LESEN " + ms(t0, tLuma) + " BEWEGUNG " + ms(tLuma, tFlow) + " BLUR " + ms(tFlow, tEnd));
+                        "  " + std::to_string(inFrameCount) + " EIN  " + what + (rep > 1 ? "  DOPPELT" : "") +
+                        "  MS "  + ms(t0, tLuma) + " / " + ms(tLuma, tFlow) + " / " + ms(tFlow, tEnd));
         return suiteError_NoError;
     }
 
