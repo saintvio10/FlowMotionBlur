@@ -345,9 +345,10 @@ bool ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& ou
 
         Buf nu, nv;
         if (L == levels - 1) {
-            const float ls = static_cast<float>(w) / I0.w; // globale Verschiebung als Startwert
-            nu = S.Upload(std::vector<float>(n, p.initU * ls));
-            nv = S.Upload(std::vector<float>(n, p.initV * ls));
+            const float ls = static_cast<float>(w) / I0.w;
+            Flow init; CoarseInit(p, I0.w, w, h, init); // Startfeld bzw. globale Verschiebung
+            nu = S.Upload(init.u.d);
+            nv = S.Upload(init.v.d);
             if (ng > 0) {
                 float scale = static_cast<float>(w) / I0.w;
                 S.Run("apply_guides", w, h, nu, nv, w, h, gbuf, ng, scale, GuideK(p.guideRadius, scale));

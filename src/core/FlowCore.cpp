@@ -272,12 +272,10 @@ void ComputeFlow(const Image& I0, const Image& I1, const FlowParams& p, Flow& ou
                     }
             });
         } else {
-            // Groebste Stufe: globale Verschiebung als Startwert
-            const float ls = static_cast<float>(w) / I0.w;
-            std::fill(init.u.d.begin(), init.u.d.end(), p.initU * ls);
-            std::fill(init.v.d.begin(), init.v.d.end(), p.initV * ls);
+            // Groebste Stufe: Startfeld bzw. globale Verschiebung
+            CoarseInit(p, I0.w, w, h, init);
             // Track Points geben zusaetzlich lokale Startwerte
-            if (guides) ApplyGuides(init, *guides, p.guideRadius, ls);
+            if (guides) ApplyGuides(init, *guides, p.guideRadius, static_cast<float>(w) / I0.w);
         }
         cur = std::move(init);
 
@@ -863,6 +861,376 @@ void VisualizeFlow(const Flow& flow, int flowScale, int outW, int outH, RGBAImag
                 o[0] = r * mag; o[1] = g * mag; o[2] = b * mag; o[3] = 1.f;
             }
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// Startfeld fuer die groebste Stufe
+// ---------------------------------------------------------------------------
+
+void CoarseInit(const FlowParams& p, int I0w, int w, int h, Flow& out)
+{
+    out.u.resize(w, h);
+    out.v.resize(w, h);
+    const float ls = static_cast<float>(w) / std::max(1, I0w);
+    if (p.initFlow && !p.initFlow->empty()) {
+        const Flow& f = *p.initFlow;
+        const float sx = static_cast<float>(f.w()) / w, sy = static_cast<float>(f.h()) / h;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                float fx = (x + 0.5f) * sx - 0.5f, fy = (y + 0.5f) * sy - 0.5f;
+                out.u.row(y)[x] = Sample(f.u, fx, fy) * ls;
+                out.v.row(y)[x] = Sample(f.v, fx, fy) * ls;
+            }
+    } else {
+        std::fill(out.u.d.begin(), out.u.d.end(), p.initU * ls);
+        std::fill(out.v.d.begin(), out.v.d.end(), p.initV * ls);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kamerabewegung direkt aus den Bildern (parametrisches Lucas-Kanade)
+// ---------------------------------------------------------------------------
+// Normierte Koordinaten: xn = (x - cx) / s0 mit s0 = max(w,h)/2. Dadurch ist H
+// unabhaengig von der Pyramidenstufe.
+
+static inline bool MapH(const double H[9], double xn, double yn, double& un, double& vn, double& z)
+{
+    z = H[6] * xn + H[7] * yn + 1.0;
+    if (z < 0.05) return false; // jenseits des Horizonts der Ebene
+    un = (H[0] * xn + H[1] * yn + H[2]) / z;
+    vn = (H[3] * xn + H[4] * yn + H[5]) / z;
+    return true;
+}
+
+// Physikalisch moegliche Kamerabewegung zwischen zwei Frames? Verwirft z. B.
+// Loesungen, die das Bild auf einen Punkt schrumpfen oder extrem verzerren.
+static bool PlausibleH(const double h[8])
+{
+    for (int i = 0; i < 8; ++i) if (!std::isfinite(h[i])) return false;
+    const double det = h[0] * h[4] - h[1] * h[3];
+    if (det < 0.2 || det > 5.0) return false;              // Flaechenaenderung max. Faktor 5
+    if (std::fabs(h[1]) > 1.0 || std::fabs(h[3]) > 1.0) return false;
+    if (std::fabs(h[6]) > 1.5 || std::fabs(h[7]) > 1.5) return false;
+    if (std::fabs(h[2]) > 2.0 || std::fabs(h[5]) > 2.0) return false; // Verschiebung max. 1 Bildbreite
+    return true;
+}
+
+// Optimiert h (8 Parameter) auf einer Pyramidenstufe. Rueckgabe: mittlerer
+// Restfehler inkl. Strafterm fuer kleine Ueberdeckung (kleiner = besser).
+static double OptimizeLevel(const Image& A, const Image& B, const Image& Bx, const Image& By,
+                            double h[8], int iters)
+{
+    const int w = A.w, hh = A.h;
+    const double s0 = 0.5 * std::max(w, hh), cx = 0.5 * (w - 1), cy = 0.5 * (hh - 1);
+    const int step = std::max(1, static_cast<int>(std::sqrt(static_cast<double>(w) * hh / 40000.0)));
+    int total = 0;
+    for (int y = 1; y < hh - 1; y += step) for (int x = 1; x < w - 1; x += step) ++total;
+    std::vector<float> res;
+    double cost = 1e9;
+    for (int it = 0; it <= iters; ++it) {
+        const double Hc[9] = { h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0 };
+        res.clear();
+        for (int y = 1; y < hh - 1; y += step)
+            for (int x = 1; x < w - 1; x += step) {
+                double xn = (x - cx) / s0, yn = (y - cy) / s0, un, vn, z;
+                if (!MapH(Hc, xn, yn, un, vn, z)) continue;
+                double px = un * s0 + cx, py = vn * s0 + cy;
+                if (px < 1 || py < 1 || px > w - 2 || py > hh - 2) continue;
+                res.push_back(std::fabs(Sample(B, (float)px, (float)py) - A.row(y)[x]));
+            }
+        const double coverage = total ? static_cast<double>(res.size()) / total : 0.0;
+        if (res.size() < 30) return 1e9;
+        double mean = 0; for (float r : res) mean += r; mean /= res.size();
+        cost = mean + 0.1 * std::max(0.0, 0.6 - coverage);
+        if (it == iters) break;
+        std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
+        const double k = std::max(0.01, 1.4826 * res[res.size() / 2] * 1.5);
+
+        std::vector<double> AtA(64, 0.0), Atb(8, 0.0);
+        for (int y = 1; y < hh - 1; y += step)
+            for (int x = 1; x < w - 1; x += step) {
+                double xn = (x - cx) / s0, yn = (y - cy) / s0, un, vn, z;
+                if (!MapH(Hc, xn, yn, un, vn, z)) continue;
+                double px = un * s0 + cx, py = vn * s0 + cy;
+                if (px < 1 || py < 1 || px > w - 2 || py > hh - 2) continue;
+                double r = Sample(B, (float)px, (float)py) - A.row(y)[x];
+                double gx = Sample(Bx, (float)px, (float)py) * s0, gy = Sample(By, (float)px, (float)py) * s0;
+                double iz = 1.0 / z, gw = gx * un + gy * vn;
+                double J[8] = { gx * xn * iz, gx * yn * iz, gx * iz, gy * xn * iz, gy * yn * iz, gy * iz,
+                                -gw * xn * iz, -gw * yn * iz };
+                double ar = std::fabs(r), wgt = ar <= k ? 1.0 : k / ar;
+                for (int a2 = 0; a2 < 8; ++a2) {
+                    Atb[a2] -= wgt * J[a2] * r;
+                    for (int b2 = a2; b2 < 8; ++b2) AtA[a2 * 8 + b2] += wgt * J[a2] * J[b2];
+                }
+            }
+        for (int a2 = 0; a2 < 8; ++a2) for (int b2 = 0; b2 < a2; ++b2) AtA[a2 * 8 + b2] = AtA[b2 * 8 + a2];
+        for (int a2 = 0; a2 < 8; ++a2) AtA[a2 * 8 + a2] = AtA[a2 * 8 + a2] * 1.001 + 1e-9;
+        if (!SolveLinear(AtA, Atb, 8)) return 1e9;
+        double maxD = 0;
+        for (int a2 = 0; a2 < 8; ++a2) {
+            double d = std::max(-0.2, std::min(0.2, Atb[a2]));
+            h[a2] += d; maxD = std::max(maxD, std::fabs(d));
+        }
+        if (maxD < 1e-6) { iters = it + 1; }
+        if (!PlausibleH(h)) return 1e9;
+    }
+    for (int i = 0; i < 8; ++i) if (!std::isfinite(h[i])) return 1e9;
+    if (!PlausibleH(h)) return 1e9;
+    return cost;
+}
+
+double HomographyCost(const Image& I0, const Image& I1, const double H[9])
+{
+    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return 1e9;
+    // auf ~480 px verkleinert bewerten (wie die feinste Stufe von AlignHomography)
+    Image A, B, sa, sb;
+    BoxFilter(I0, 1, A); BoxFilter(I1, 1, B);
+    while (std::max(A.w, A.h) > 480) { Downscale(A, 2, sa); Downscale(B, 2, sb); BoxFilter(sa, 1, A); BoxFilter(sb, 1, B); }
+    Image Bx, By; Bx.resize(B.w, B.h); By.resize(B.w, B.h);
+    double h[8]; for (int k = 0; k < 8; ++k) h[k] = H[k] / H[8];
+    return OptimizeLevel(A, B, Bx, By, h, 0);
+}
+
+bool InvertHomography(const double H[9], double Hi[9])
+{
+    const double a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7], i = H[8];
+    double A[9] = { e * i - f * h, c * h - b * i, b * f - c * e,
+                    f * g - d * i, a * i - c * g, c * d - a * f,
+                    d * h - e * g, b * g - a * h, a * e - b * d };
+    const double det = a * A[0] + b * A[3] + c * A[6];
+    if (std::fabs(det) < 1e-12 || std::fabs(A[8]) < 1e-12) return false;
+    for (int k = 0; k < 9; ++k) Hi[k] = A[k] / A[8];
+    return true;
+}
+
+bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initDy,
+                     double H[9], double* residual, const double* extraInit)
+{
+    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return false;
+    // Pyramide bis ~48 px
+    std::vector<Image> P0(1), P1(1);
+    BoxFilter(I0, 1, P0[0]); BoxFilter(I1, 1, P1[0]);
+    while (std::max(P0.back().w, P0.back().h) > 64 && std::min(P0.back().w, P0.back().h) / 2 >= 24) {
+        Image a, b, sa, sb;
+        Downscale(P0.back(), 2, a); Downscale(P1.back(), 2, b);
+        BoxFilter(a, 1, sa); BoxFilter(b, 1, sb);
+        P0.push_back(std::move(sa)); P1.push_back(std::move(sb));
+    }
+    int finest = 0;
+    while (finest + 1 < static_cast<int>(P0.size()) && std::max(P0[finest].w, P0[finest].h) > 480) ++finest;
+    const int coarsest = static_cast<int>(P0.size()) - 1;
+
+    auto grads = [](const Image& B, Image& Bx, Image& By) {
+        const int w = B.w, hh = B.h;
+        Bx.resize(w, hh); By.resize(w, hh);
+        for (int y = 0; y < hh; ++y)
+            for (int x = 0; x < w; ++x) {
+                Bx.row(y)[x] = 0.5f * (B.row(y)[std::min(x + 1, w - 1)] - B.row(y)[std::max(x - 1, 0)]);
+                By.row(y)[x] = 0.5f * (B.row(std::min(y + 1, hh - 1))[x] - B.row(std::max(y - 1, 0))[x]);
+            }
+    };
+
+    // Startlagen: Verschiebung aus der Vorsuche, kombiniert mit Vorwaerts-/
+    // Rueckwaertsflug (Zoom) um verschiedene Fluchtpunkte. Grosse Bewegungen
+    // (Speed Ramps) liegen sonst ausserhalb des Einzugsbereichs.
+    const double s00 = 0.5 * std::max(I0.w, I0.h);
+    const double tx = initDx / s00, ty = initDy / s00;
+    struct Hyp { double h[8]; double cost; };
+    std::vector<Hyp> hyps;
+    const double scales[] = { 1.0, 1.08, 1.18, 1.32, 1.5, 1.75, 0.93, 0.85, 0.76, 0.66 };
+    const double centersY[] = { 0.0, -0.5, -0.9, 0.5 };
+    for (double sc : scales)
+        for (double cyn : centersY) {
+            if (sc == 1.0 && cyn != 0.0) continue;
+            // Skalierung um (0, cyn): x' = sc*x, y' = cyn + sc*(y - cyn)
+            Hyp hp = { { sc, 0, tx, 0, sc, ty + cyn * (1 - sc), 0, 0 }, 0 };
+            hyps.push_back(hp);
+        }
+
+    {
+        Image Bx, By; grads(P1[coarsest], Bx, By);
+        for (Hyp& hp : hyps) hp.cost = OptimizeLevel(P0[coarsest], P1[coarsest], Bx, By, hp.h, 30);
+    }
+    std::sort(hyps.begin(), hyps.end(), [](const Hyp& a, const Hyp& b) { return a.cost < b.cost; });
+    // die besten drei auf der naechsten Stufe gegeneinander pruefen
+    if (hyps.size() > 3) hyps.resize(3);
+    int level = coarsest;
+    if (coarsest - 1 >= finest) {
+        level = coarsest - 1;
+        Image Bx, By; grads(P1[level], Bx, By);
+        for (Hyp& hp : hyps) hp.cost = OptimizeLevel(P0[level], P1[level], Bx, By, hp.h, 20);
+        std::sort(hyps.begin(), hyps.end(), [](const Hyp& a, const Hyp& b) { return a.cost < b.cost; });
+    }
+    double h[8]; std::copy(hyps[0].h, hyps[0].h + 8, h);
+    double lastCost = hyps[0].cost;
+    for (int L = level - 1; L >= finest; --L) {
+        Image Bx, By; grads(P1[L], Bx, By);
+        lastCost = OptimizeLevel(P0[L], P1[L], Bx, By, h, 20);
+    }
+    // Zusaetzliche Startlage (z. B. Umkehrung der Gegenrichtung): nur auf den
+    // feinen Stufen verfeinern - grobe Stufen koennten sie verwerfen.
+    if (extraInit && std::fabs(extraInit[8]) > 1e-12) {
+        double he[8]; for (int k = 0; k < 8; ++k) he[k] = extraInit[k] / extraInit[8];
+        double ce = 1e9;
+        for (int L = std::min(coarsest, finest + 1); L >= finest; --L) {
+            Image Bx, By; grads(P1[L], Bx, By);
+            ce = OptimizeLevel(P0[L], P1[L], Bx, By, he, 20);
+        }
+        if (ce < lastCost) { std::copy(he, he + 8, h); lastCost = ce; }
+    }
+    if (lastCost >= 1e8) return false;
+    for (int i = 0; i < 8; ++i) H[i] = h[i];
+    H[8] = 1.0;
+    if (residual) *residual = lastCost;
+    return true;
+}
+
+void HomographyField(const double H[9], int w, int h, Flow& out)
+{
+    out.u.resize(w, h);
+    out.v.resize(w, h);
+    const double s0 = 0.5 * std::max(w, h), cx = 0.5 * (w - 1), cy = 0.5 * (h - 1);
+    const float lim = static_cast<float>(std::max(w, h));
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                double xn = (x - cx) / s0, yn = (y - cy) / s0, un, vn, z;
+                float u = 0, v = 0;
+                if (MapH(H, xn, yn, un, vn, z)) {
+                    u = static_cast<float>(un * s0 + cx - x);
+                    v = static_cast<float>(vn * s0 + cy - y);
+                    if (std::fabs(u) > lim || std::fabs(v) > lim) u = v = 0; // unbrauchbar
+                }
+                out.u.row(y)[x] = u; out.v.row(y)[x] = v;
+            }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Auswahl je Bildstelle: Modell / feines Tracking / keine Bewegung
+// ---------------------------------------------------------------------------
+
+void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
+                      Flow* fwd, Flow* bwd, const Flow* mf, const Flow* mb, SelectStats* stats)
+{
+    const int w = I0.w, h = I0.h;
+    if (fwd && fwd->empty()) fwd = nullptr;
+    if (bwd && bwd->empty()) bwd = nullptr;
+    if (!fwd) Inext = nullptr;
+    if (!bwd) Iprev = nullptr;
+    if (!Inext && !Iprev) return;
+    if (mf && mf->empty()) mf = nullptr;
+    if (mb && mb->empty()) mb = nullptr;
+
+    // Fotometrischer Fehler eines Kandidaten (beide Richtungen zusammen)
+    auto cost = [&](const Flow* cf, const Flow* cb, Image& out) {
+        Image raw; raw.resize(w, h);
+        ParallelFor(0, h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < w; ++x) {
+                    // Mittel ueber die Richtungen, deren Ziel im Bild liegt. Zeigt die
+                    // Bewegung aus dem Bild (Inhalt verlaesst das Bild, z. B. unten beim
+                    // Vorwaertsflug), zaehlt nur die andere Richtung - kein Strafwert.
+                    float e = 0; int n = 0;
+                    const float c0 = I0.row(y)[x];
+                    if (Inext) {
+                        float u = cf ? cf->u.row(y)[x] : 0.f, v = cf ? cf->v.row(y)[x] : 0.f;
+                        float tx = x + u, ty = y + v;
+                        if (tx >= 0 && ty >= 0 && tx <= w - 1 && ty <= h - 1) { e += std::fabs(Sample(*Inext, tx, ty) - c0); ++n; }
+                    }
+                    if (Iprev) {
+                        float u = cb ? cb->u.row(y)[x] : 0.f, v = cb ? cb->v.row(y)[x] : 0.f;
+                        float tx = x + u, ty = y + v;
+                        if (tx >= 0 && ty >= 0 && tx <= w - 1 && ty <= h - 1) { e += std::fabs(Sample(*Iprev, tx, ty) - c0); ++n; }
+                    }
+                    raw.row(y)[x] = n ? e / n : 0.3f; // fuehrt in beide Richtungen aus dem Bild
+                }
+        });
+        SoftFilter(raw, 6, out);
+    };
+
+    Image cLocal, cZero, cModel;
+    cost(fwd, bwd, cLocal);
+    cost(nullptr, nullptr, cZero);
+    const bool haveModel = (Inext ? mf != nullptr : true) && (Iprev ? mb != nullptr : true);
+    if (haveModel) cost(mf, mb, cModel);
+
+    // Modell leicht bevorzugen (glatt, flackerfrei); "keine Bewegung" nur, wenn
+    // es deutlich besser passt (z. B. Himmel, unendlich weit entfernt).
+    long nM = 0, nL = 0, nZ = 0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            float l = cLocal.row(y)[x], z = cZero.row(y)[x], m = haveModel ? cModel.row(y)[x] * 0.55f : 1e9f;
+            int pick = 1; float best = l;
+            if (m <= best) { best = m; pick = 0; }
+            if (z < best * 0.5f) { best = z; pick = 2; }
+            if (pick == 0) {
+                ++nM;
+                if (fwd && mf) { fwd->u.row(y)[x] = mf->u.row(y)[x]; fwd->v.row(y)[x] = mf->v.row(y)[x]; }
+                if (bwd && mb) { bwd->u.row(y)[x] = mb->u.row(y)[x]; bwd->v.row(y)[x] = mb->v.row(y)[x]; }
+            } else if (pick == 2) {
+                ++nZ;
+                if (fwd) { fwd->u.row(y)[x] = 0; fwd->v.row(y)[x] = 0; }
+                if (bwd) { bwd->u.row(y)[x] = 0; bwd->v.row(y)[x] = 0; }
+            } else ++nL;
+        }
+    // Uebergaenge zwischen den Kandidaten leicht glaetten
+    for (Flow* f : { fwd, bwd }) {
+        if (!f) continue;
+        Image a, b; SoftFilter(f->u, 2, a); SoftFilter(f->v, 2, b);
+        f->u = std::move(a); f->v = std::move(b);
+    }
+    if (stats) {
+        const float n = static_cast<float>(std::max<long>(1, static_cast<long>(w) * h));
+        stats->model = nM / n; stats->local = nL / n; stats->zero = nZ / n;
+    }
+}
+
+
+void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowParams& p,
+                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info)
+{
+    CameraInfo ci;
+    Flow mf, mb;
+    double Hf[9], Hb[9];
+    float fdx = 0, fdy = 0, bdx = 0, bdy = 0;
+    if (In && fwd) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignHomography(I0, *In, fdx, fdy, Hf, &ci.resF); }
+    if (Ip && bwd) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignHomography(I0, *Ip, bdx, bdy, Hb, &ci.resB); }
+    const double Hid[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const double zeroF = (In && fwd) ? HomographyCost(I0, *In, Hid) : 0;
+    const double zeroB = (Ip && bwd) ? HomographyCost(I0, *Ip, Hid) : 0;
+    // Gegenrichtung als zusaetzliche Startlage: rueckwaerts ~ Umkehrung von vorwaerts.
+    // Hilft besonders bei grossen Bewegungen, wo eine Richtung viel Inhalt verliert.
+    if (ci.modelF && Ip && bwd) {
+        double inv[9], H2[9], r2;
+        if (InvertHomography(Hf, inv) && AlignHomography(I0, *Ip, bdx, bdy, H2, &r2, inv) && (!ci.modelB || r2 < ci.resB)) {
+            std::copy(H2, H2 + 9, Hb); ci.resB = r2; ci.modelB = true;
+        }
+    }
+    if (ci.modelB && In && fwd) {
+        double inv[9], H2[9], r2;
+        if (InvertHomography(Hb, inv) && AlignHomography(I0, *In, fdx, fdy, H2, &r2, inv) && (!ci.modelF || r2 < ci.resF)) {
+            std::copy(H2, H2 + 9, Hf); ci.resF = r2; ci.modelF = true;
+        }
+    }
+    // Modell nur verwenden, wenn es besser zu den Bildern passt als "keine Bewegung"
+    if (ci.modelF && HomographyCost(I0, *In, Hf) >= zeroF) ci.modelF = false;
+    if (ci.modelB && HomographyCost(I0, *Ip, Hb) >= zeroB) ci.modelB = false;
+    auto track = [&](const Image* In1, Flow* out, Flow& model, bool ok, const double* Hm, float dx, float dy) {
+        if (!In1 || !out) return;
+        FlowParams q = p;
+        if (ok) { HomographyField(Hm, I0.w, I0.h, model); q.initFlow = &model; }
+        else    { q.initU = dx; q.initV = dy; }
+        flowFn(I0, *In1, q, *out);
+    };
+    track(In, fwd, mf, ci.modelF, Hf, fdx, fdy);
+    track(Ip, bwd, mb, ci.modelB, Hb, bdx, bdy);
+    RefineFlows(I0, In ? fwd : nullptr, Ip ? bwd : nullptr);
+    SelectCandidates(I0, In, Ip, In ? fwd : nullptr, Ip ? bwd : nullptr,
+                     ci.modelF ? &mf : nullptr, ci.modelB ? &mb : nullptr, &ci.sel);
+    if (info) *info = ci;
 }
 
 } // namespace fmb

@@ -59,8 +59,8 @@ static void WritePPM(const std::string& path, const RGBAImage& img)
     std::fclose(f);
 }
 
-enum Method { OLD, REFINE, CAMERA };
-struct Res { double epe, blurErr; RGBAImage blurred; };
+enum Method { OLD, REFINE, CAMERA, CAMERA15 };
+struct Res { double epe, blurErr, sky; RGBAImage blurred; };
 
 static Res Run(double camY, double speed, Method m)
 {
@@ -69,6 +69,9 @@ static Res Run(double camY, double speed, Method m)
     Image l0, lp, ln; LumaFromRGBA(cur, scale, l0); LumaFromRGBA(prev, scale, lp); LumaFromRGBA(next, scale, ln);
     FlowParams fp; Flow f, b;
     if (m == OLD) { ComputeFlow(l0, ln, fp, f); ComputeFlow(l0, lp, fp, b); }
+    else if (m == CAMERA15) {
+        CameraFlows(l0, &ln, &lp, fp, [](const Image& a, const Image& b2, const FlowParams& q, Flow& o) { ComputeFlow(a, b2, q, o); }, &f, &b);
+    }
     else {
         FlowParams ff = fp, fb = fp;
         EstimateGlobalShift(l0, ln, ff.initU, ff.initV); EstimateGlobalShift(l0, lp, fb.initU, fb.initV);
@@ -76,6 +79,10 @@ static Res Run(double camY, double speed, Method m)
         if (m == CAMERA) { if (!FitCameraModel(l0, &f, &b)) RefineFlows(l0, &f, &b); }
         else RefineFlows(l0, &f, &b);
     }
+    // Himmel: echte Bewegung 0
+    double se = 0; int sn = 0;
+    for (int y = 10; y < H - 10; y += 3) for (int x = 10; x < W - 10; x += 3)
+        if (Ray(x + 0.5, y + 0.5).z > 0.05) { se += std::hypot(f.u.row(y / scale)[x / scale], f.v.row(y / scale)[x / scale]) * scale; ++sn; }
     // Tracking-Fehler (Boden, nicht Himmel, Rand 10 px)
     double e = 0; int n = 0;
     for (int y = 10; y < H - 10; y += 3) for (int x = 10; x < W - 10; x += 3) {
@@ -84,7 +91,7 @@ static Res Run(double camY, double speed, Method m)
         e += std::hypot(f.u.row(y / scale)[x / scale] * scale - tu, f.v.row(y / scale)[x / scale] * scale - tv); ++n;
     }
     BlurParams bp; bp.shutter = 0.5f; bp.maxSamples = 64; bp.mode = (m == OLD) ? kBlurObjects : kBlurNatural;
-    Res r; ApplyMotionBlur(cur, &f, &b, scale, bp, r.blurred); r.epe = e / n;
+    Res r; ApplyMotionBlur(cur, &f, &b, scale, bp, r.blurred); r.epe = e / n; r.sky = sn ? se / sn : 0;
     // echte Belichtung: 48 Zwischenbilder ueber 180 Grad Verschluss
     RGBAImage ref; ref.resize(W, H); const int N = 48;
     for (int i = 0; i < N; ++i) { RGBAImage s; Render(camY + speed * (-0.25 + 0.5 * (i + 0.5) / N), s); for (size_t k = 0; k < ref.d.size(); ++k) ref.d[k] += s.d[k] / N; }
@@ -96,20 +103,20 @@ static Res Run(double camY, double speed, Method m)
 int main(int argc, char** argv)
 {
     std::string out = argc > 1 ? argv[1] : ".";
-    for (double speed : { 0.6, 2.5 }) {
+    for (double speed : { 0.6, 2.5, 7.0 }) {
         double tu, tv; TrueFlow(W / 2.0, H - 5.0, speed, tu, tv);
-        std::printf("\nFluggeschwindigkeit %.1f -> Bewegung unten im Bild %.0f px/Frame%s\n", speed, std::hypot(tu, tv), speed > 1 ? " (Speed Ramp)" : "");
-        const char* names[] = { "alt (1.3 Objekte)", "Frei + Auffuellen", "Kamera-Modell" };
-        for (int m = 0; m < 3; ++m) {
-            double sumE = 0, sumB = 0, minB = 1e9, maxB = 0;
+        std::printf("\nFluggeschwindigkeit %.1f -> Bewegung unten im Bild %.0f px/Frame%s\n", speed, std::hypot(tu, tv), speed > 5 ? " (starke Speed Ramp)" : speed > 1 ? " (Speed Ramp)" : "");
+        const char* names[] = { "alt (1.3 Objekte)", "Frei + Auffuellen", "Kamera 1.4 (RANSAC)", "Kamera 1.5 (direkt)" };
+        for (int m = 0; m < 4; ++m) {
+            double sumE = 0, sumB = 0, minB = 1e9, maxB = 0, sumS = 0;
             Res last;
             for (int fr = 0; fr < 4; ++fr) {   // 4 aufeinanderfolgende Frames -> Flackern
                 Res r = Run(fr * speed, speed, (Method)m);
-                sumE += r.epe; sumB += r.blurErr; minB = std::min(minB, r.blurErr); maxB = std::max(maxB, r.blurErr);
+                sumE += r.epe; sumB += r.blurErr; sumS += r.sky; minB = std::min(minB, r.blurErr); maxB = std::max(maxB, r.blurErr);
                 if (fr == 0) last = r;
             }
-            std::printf("  %-20s Tracking-Fehler %6.2f px   Abw. zur echten Belichtung %.4f   Schwankung %.4f\n",
-                        names[m], sumE / 4, sumB / 4, maxB - minB);
+            std::printf("  %-20s Boden-Fehler %6.2f px   Himmel %6.2f px   Abw. Belichtung %.4f   Schwankung %.4f\n",
+                        names[m], sumE / 4, sumS / 4, sumB / 4, maxB - minB);
             WritePPM(out + "/drone_s" + std::to_string((int)(speed * 10)) + "_m" + std::to_string(m) + ".ppm", last.blurred);
         }
         RGBAImage ref; ref.resize(W, H); const int N = 48;

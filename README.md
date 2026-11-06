@@ -1,5 +1,7 @@
 # Flow Motion Blur – Plugin für Premiere Pro (und After Effects)
 
+**Version 1.5**
+
 Automatische, vektorbasierte Bewegungsunschärfe: Das Plugin verfolgt jeden Pixel
 vom vorherigen zum nächsten Frame (optischer Fluss) und verwischt das Bild entlang
 dieser Bewegung. Einfach auf einen Clip ziehen – fertig.
@@ -23,12 +25,14 @@ dieser Bewegung. Einfach auf einen Clip ziehen – fertig.
 | Parameter | Bedeutung |
 |---|---|
 | **Blur Amount (Shutter)** | Stärke. 0.5 = Film-Look (180°), 1.0 = doppelt so lang |
+| **Bewegungsart** | **Kamera (Drohne, Schwenk, Fahrt)**: Die Kamerabewegung wird direkt aus den Bildern als ein perspektivisches Modell bestimmt (auch bei Speed Ramps mit sehr großer Bewegung). Je Bildstelle wird gewählt, ob Modell, feines Tracking oder Ruhe (z. B. Himmel) am besten passt. **Frei (bewegte Objekte)**: für bewegte Dinge bei ruhiger Kamera. |
+| **Unschärfe-Modus** | **Natürlich (Kamera)**: jeder Pixel entlang seiner eigenen Bewegung, wie eine echte Belichtung. **Objekte**: schnelle Objekte verschmieren über den Hintergrund. |
 | **Max Samples** | Qualität der Verwischung. Höher = glatter, langsamer |
 | **Analyse-Qualität** | Auflösung der Bewegungsanalyse (Schnell ¼, Normal ½, Hoch voll) |
 | **Vektor-Glättung** | Glättet das Bewegungsfeld; höher bei unruhigen Ergebnissen |
 | **RGB+A-Tracking** | Nutzt den Alphakanal für die Analyse mit |
 | **GPU verwenden** | Rechnet per OpenCL auf der Grafikkarte, sonst automatisch CPU |
-| **Ansicht** | „Bewegungsvektoren“ zeigt Richtung (Farbe) und Stärke (Helligkeit) |
+| **Ansicht** | „Bewegungsvektoren“ zeigt Richtung (Farbe) und Stärke (Helligkeit); „Diagnose“ schreibt Pixelformat, Zeitschritte, Status der Nachbarframes und des Kameramodells ins Bild |
 | **Vektor-Quelle** | „Automatisch (Tracking)“ oder „Vektor-Ebene“ |
 
 ### Eigene Bewegungsvektoren

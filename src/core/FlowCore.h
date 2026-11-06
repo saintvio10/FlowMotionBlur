@@ -68,6 +68,7 @@ struct FlowParams {
     float guideRadius    = 40.f;   // Einflussradius der Track Points (px, Fluss-Aufloesung)
     float initU          = 0.f;    // Startwert der Bewegung (globale Verschiebung, px von I0)
     float initV          = 0.f;
+    const struct Flow* initFlow = nullptr; // optional: Startfeld (Groesse wie I0), ersetzt initU/V
 };
 
 // Art der Unschaerfe
@@ -105,6 +106,49 @@ void ApplyGuides(Flow& f, const std::vector<Guide>& guides, float radius, float 
 // Dient als Startwert fuer ComputeFlow, damit auch sehr grosse Bewegungen
 // (Speed Ramps) gefunden werden. Ergebnis in Pixeln von I0.
 void EstimateGlobalShift(const Image& I0, const Image& I1, float& dx, float& dy);
+
+// Startfeld fuer die groebste Pyramidenstufe (w x h) aus FlowParams.
+void CoarseInit(const FlowParams& p, int I0w, int w, int h, Flow& out);
+
+// Bestimmt die Kamerabewegung von I0 nach I1 direkt aus den Bildern als
+// Homographie (Zoom, Drehung, Perspektive), grob-nach-fein mit robuster
+// Gewichtung. H arbeitet in normierten Koordinaten (siehe HomographyField).
+// initDx/initDy: Startverschiebung in Pixeln von I0. residual: mittlerer
+// Restfehler (Helligkeit 0..1). false, wenn die Schaetzung scheitert.
+bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initDy,
+                     double H[9], double* residual = nullptr, const double* extraInit = nullptr);
+
+// Fotometrischer Restfehler einer Homographie (ohne Optimierung), zum Vergleich
+// verschiedener Kandidaten. Kleiner = besser.
+double HomographyCost(const Image& I0, const Image& I1, const double H[9]);
+
+// Umkehrung einer Homographie (normiert auf h33 = 1). false, wenn singulaer.
+bool InvertHomography(const double H[9], double Hi[9]);
+
+// Vektorfeld (w x h, Pixel) einer Homographie aus AlignHomography.
+void HomographyField(const double H[9], int w, int h, Flow& out);
+
+// Waehlt fuer jede Bildstelle die Bewegung, die am besten zu den Bildern passt:
+// Kameramodell (mf/mb), feines Tracking (fwd/bwd, werden ueberschrieben) oder
+// keine Bewegung. Inext/Iprev: Nachbarbilder (Luminanz, wie I0), je optional.
+struct SelectStats { float model = 0, local = 0, zero = 0; };
+void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
+                      Flow* fwd, Flow* bwd, const Flow* mf, const Flow* mb, SelectStats* stats = nullptr);
+
+// Kompletter Ablauf fuer Kamerabewegung (Drohne, Schwenk, Fahrt):
+//  1. Kamerabewegung direkt aus den Bildern (AlignHomography)
+//  2. feines Tracking mit dem Modell als Startfeld (flowFn = CPU oder GPU)
+//  3. unsichere Vektoren auffuellen (RefineFlows)
+//  4. je Bildstelle Modell / Tracking / keine Bewegung waehlen (SelectCandidates)
+// In/Ip: Luminanz des naechsten/vorherigen Bildes (wie I0), je optional.
+struct CameraInfo {
+    bool modelF = false, modelB = false;
+    double resF = 0, resB = 0;
+    SelectStats sel;
+};
+using FlowFn = std::function<void(const Image&, const Image&, const FlowParams&, Flow&)>;
+void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowParams& p,
+                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info = nullptr);
 
 // Kameramodell: Bei Kamerabewegung (Drohne, Schwenk, Fahrt) folgt die Bewegung
 // im ganzen Bild einer perspektivischen Abbildung (Homographie). Diese wird

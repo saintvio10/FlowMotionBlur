@@ -500,10 +500,13 @@ static void ResizeRGBA(const fmb::RGBAImage& src, int w, int h, fmb::RGBAImage& 
 
 // Holt den Frame bei current_time + offset und berechnet den Fluss dorthin.
 // Gibt false zurueck, wenn kein brauchbarer Nachbarframe existiert (Clip-Anfang/-Ende).
+// computeFlow = false: nur die Luminanz des Nachbarframes liefern (nbLuma),
+// der Fluss wird dann gemeinsam fuer beide Richtungen berechnet (Kamera-Modus).
 static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImage& cur,
                           const fmb::Image& curLuma, int factor, const fmb::FlowParams& fp,
                           float alphaWeight, double curAlpha, const std::vector<fmb::Guide>& guides,
-                          const Engine& eng, fmb::Flow& flow, PF_Err& err, NbInfo& info)
+                          const Engine& eng, fmb::Flow& flow, PF_Err& err, NbInfo& info,
+                          bool computeFlow, fmb::Image& nbLuma)
 {
     PF_ParamDef ck;
     AEFX_CLR_STRUCT(ck);
@@ -539,19 +542,17 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
             if (curAlpha > 0.0 && AlphaSum(nb) <= 0.02 * curAlpha) {
                 info.status = "TRANSPARENT (AUSSERHALB DES CLIPS)" + sizeNote;
             } else {
-                fmb::Image nbLuma;
                 fmb::LumaFromRGBA(nb, factor, nbLuma, alphaWeight);
                 double d = 0;
                 for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
                 info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
-                // Grobe Vorsuche: findet auch sehr grosse Bewegungen (Speed Ramps)
-                fmb::FlowParams fp2 = fp;
-                fmb::EstimateGlobalShift(curLuma, nbLuma, fp2.initU, fp2.initV);
-                info.shift = std::hypot(fp2.initU, fp2.initV) * factor;
-                eng.Flow(curLuma, nbLuma, fp2, guides.empty() ? nullptr : &guides, flow);
-                double m = 0;
-                for (size_t i = 0; i < flow.u.d.size(); ++i) m += std::hypot(flow.u.d[i], flow.v.d[i]);
-                info.motion = flow.u.d.empty() ? 0 : m / flow.u.d.size() * factor;
+                if (computeFlow) {
+                    // Grobe Vorsuche: findet auch sehr grosse Bewegungen (Speed Ramps)
+                    fmb::FlowParams fp2 = fp;
+                    fmb::EstimateGlobalShift(curLuma, nbLuma, fp2.initU, fp2.initV);
+                    info.shift = std::hypot(fp2.initU, fp2.initV) * factor;
+                    eng.Flow(curLuma, nbLuma, fp2, guides.empty() ? nullptr : &guides, flow);
+                }
                 info.status = (info.diff < 1e-4 ? "OK, ABER GLEICHES BILD" : "OK") + sizeNote;
                 ok = true;
             }
@@ -641,31 +642,41 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         const std::vector<fmb::Guide>& gBtrack = cameraMode ? noGuides : gB;
 
         fmb::Flow fwd, bwd;
+        fmb::Image lumF, lumB;
         NbInfo infoF, infoB;
-        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, infoF);
+        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, infoF, !cameraMode, lumF);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
-        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, infoB);
+        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, infoB, !cameraMode, lumB);
         if (err) return err;
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
-        // Kamera-Modell: eine perspektivische Bewegung fuer das ganze Bild
-        // (glatt, flackerfrei). Sonst / falls kein Modell passt: unsichere
-        // Vektoren aus der verlaesslichen Umgebung auffuellen.
-        const char* modelState = "AUS (FREI)";
-        if (cameraMode) {
-            if (fmb::FitCameraModel(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr))
-                modelState = "OK";
-            else {
-                modelState = "NICHT GEFUNDEN -> FREI";
-                fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
-            }
+        std::string modelState = "AUS (FREI)";
+        if (cameraMode && (haveF || haveB)) {
+            // Kamerabewegung direkt aus den Bildern, feines Tracking ab diesem
+            // Modell, Auswahl je Bildstelle (Modell / Tracking / keine Bewegung).
+            fmb::CameraInfo ci;
+            fmb::CameraFlows(curLuma, haveF ? &lumF : nullptr, haveB ? &lumB : nullptr, fp,
+                             [&](const fmb::Image& a, const fmb::Image& b, const fmb::FlowParams& q, fmb::Flow& o) {
+                                 eng.Flow(a, b, q, nullptr, o);
+                             },
+                             haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci);
+            const bool okAll = (!haveF || ci.modelF) && (!haveB || ci.modelB);
+            modelState = std::string(okAll ? "OK" : "TEILWEISE") + "  MODELL " + Num(ci.sel.model * 100, 0) +
+                         "% TRACKING " + Num(ci.sel.local * 100, 0) + "% RUHE " + Num(ci.sel.zero * 100, 0) + "%";
             // Track Points zuletzt anwenden
             if (haveF && !gF.empty()) fmb::ApplyGuides(fwd, gF, fp.guideRadius, 1.f);
             if (haveB && !gB.empty()) fmb::ApplyGuides(bwd, gB, fp.guideRadius, 1.f);
-        } else {
+        } else if (!cameraMode) {
             fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
         }
+        // mittlere Bewegung fuer die Diagnose
+        auto meanMotion = [&](const fmb::Flow& f) {
+            double m = 0; for (size_t i = 0; i < f.u.d.size(); ++i) m += std::hypot(f.u.d[i], f.v.d[i]);
+            return f.u.d.empty() ? 0.0 : m / f.u.d.size() * factor;
+        };
+        if (haveF) infoF.motion = meanMotion(fwd);
+        if (haveB) infoB.motion = meanMotion(bwd);
 
         if (view == VIEW_VECTORS) {
             const fmb::Flow& show = haveF ? fwd : bwd;
@@ -684,7 +695,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("TIME_STEP: " + std::to_string(in_data->time_step) + "  LOCAL: " + std::to_string(in_data->local_time_step));
             L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")");
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
-            L.push_back(std::string("KAMERA-MODELL: ") + modelState);
+            L.push_back("KAMERA: " + modelState);
             L.push_back("VORWAERTS: " + infoF.status);
             L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
             L.push_back("RUECKWAERTS: " + infoB.status);
