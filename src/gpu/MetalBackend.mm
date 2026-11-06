@@ -25,8 +25,8 @@ using namespace metal;
 struct LumaP { int w, h, rowBytes, isHalf, factor, ow, oh; float alphaW; };
 struct BlurP {
     int w, h, rowIn, rowOut, halfIn, halfOut;
-    int fw, fh, mode, maxS;
-    float scale, halfShutter, maxRadius, minMotion;
+    int fw, fh, mode, maxS, soft;
+    float scale, shutter, maxRadius, minMotion, phase;
 };
 
 // Pixel lesen/schreiben (BGRA -> RGBA)
@@ -87,8 +87,8 @@ kernel void luma_down(device const uchar* src [[buffer(0)]], device float* outL 
     outA[gid.y * P.ow + gid.x] = sa / n;
 }
 
-// Bewegungsunschaerfe "Natuerlich": jeder Pixel mittelt entlang seiner Bahn.
-// mode: 0 = vor+rueck, 1 = nur vorwaerts, 2 = nur rueckwaerts
+// Bewegungsunschaerfe "Natuerlich": jeder Pixel mittelt entlang seiner Bahn
+// (wie MakeBlurPath/ApplyMotionBlur in FlowCore). mode: 0 = vor+rueck, 1 = vor, 2 = rueck
 kernel void blur_natural(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]],
                          device const float* fu [[buffer(2)]], device const float* fv [[buffer(3)]],
                          device const float* bu [[buffer(4)]], device const float* bv [[buffer(5)]],
@@ -98,33 +98,36 @@ kernel void blur_natural(device const uchar* src [[buffer(0)]], device uchar* ds
     if (x >= P.w || y >= P.h) return;
     float inv = 1.0f / P.scale;
     float fx = (x + 0.5f) * inv - 0.5f, fy = (y + 0.5f) * inv - 0.5f;
+    float a = 0, b = 0, c = 0, d = 0;
+    if (P.mode != 2) { a = smp(fu, P.fw, P.fh, fx, fy) * P.scale; b = smp(fv, P.fw, P.fh, fx, fy) * P.scale; }
+    if (P.mode != 1) { c = smp(bu, P.fw, P.fh, fx, fy) * P.scale; d = smp(bv, P.fw, P.fh, fx, fy) * P.scale; }
     float vx, vy;
-    if (P.mode == 0) {
-        vx = 0.5f * (smp(fu, P.fw, P.fh, fx, fy) - smp(bu, P.fw, P.fh, fx, fy));
-        vy = 0.5f * (smp(fv, P.fw, P.fh, fx, fy) - smp(bv, P.fw, P.fh, fx, fy));
-    } else if (P.mode == 1) {
-        vx = smp(fu, P.fw, P.fh, fx, fy); vy = smp(fv, P.fw, P.fh, fx, fy);
-    } else {
-        vx = -smp(bu, P.fw, P.fh, fx, fy); vy = -smp(bv, P.fw, P.fh, fx, fy);
-    }
-    vx *= P.scale; vy *= P.scale;
+    if (P.mode == 0)      { vx = 0.5f * (a - c); vy = 0.5f * (b - d); }
+    else if (P.mode == 1) { vx = a; vy = b; }
+    else                  { vx = -c; vy = -d; }
     if (P.minMotion > 0.0f) {
         float l = sqrt(vx * vx + vy * vy);
         float k = l > P.minMotion ? (l - P.minMotion) / l : 0.0f;
         vx *= k; vy *= k;
     }
-    vx *= P.halfShutter; vy *= P.halfShutter;
-    float len = sqrt(vx * vx + vy * vy);
-    if (len > P.maxRadius) { vx *= P.maxRadius / len; vy *= P.maxRadius / len; len = P.maxRadius; }
-    if (len < 0.25f) { stpx(dst, P.rowOut, x, y, P.halfOut, ldpx(src, P.rowIn, x, y, P.halfIn)); return; }
-    int S = min(P.maxS, int(ceil(2.0f * len)) + 1);
+    float hs = 0.5f * P.shutter;
+    float speed = sqrt(vx * vx + vy * vy);
+    float l0 = speed * fabs(hs * (-1.0f + P.phase)), l1 = speed * fabs(hs * (1.0f + P.phase));
+    float L = max(l0, l1);
+    if (L > P.maxRadius) { float k = P.maxRadius / L; vx *= k; vy *= k; l0 *= k; l1 *= k; L = P.maxRadius; }
+    if (L < 0.25f) { stpx(dst, P.rowOut, x, y, P.halfOut, ldpx(src, P.rowIn, x, y, P.halfIn)); return; }
+    int S = min(P.maxS, int(ceil(l0 + l1)) + 1);
     if ((S & 1) == 0) ++S;
-    float4 acc = float4(0.0f);
+    float4 acc = float4(0.0f); float wsum = 0.0f;
     for (int i = 0; i < S; ++i) {
         float t = (S == 1) ? 0.0f : -1.0f + 2.0f * i / (S - 1);
-        acc += smp4(src, P.rowIn, P.w, P.h, P.halfIn, x + vx * t, y + vy * t);
+        float w = P.soft ? clamp((1.0f - fabs(t)) / 0.35f, 0.0f, 1.0f) : 1.0f;
+        if (w <= 0.0f) continue;
+        float sp = hs * (t + P.phase);
+        acc += w * smp4(src, P.rowIn, P.w, P.h, P.halfIn, x - vx * sp, y - vy * sp);
+        wsum += w;
     }
-    acc *= (1.0f / S);
+    acc *= (1.0f / wsum);
     if (acc.w > 1e-6f) acc.xyz /= acc.w;
     stpx(dst, P.rowOut, x, y, P.halfOut, acc);
 }
@@ -140,8 +143,8 @@ kernel void copy_px(device const uchar* src [[buffer(0)]], device uchar* dst [[b
 struct LumaP { int w, h, rowBytes, isHalf, factor, ow, oh; float alphaW; };
 struct BlurP {
     int w, h, rowIn, rowOut, halfIn, halfOut;
-    int fw, fh, mode, maxS;
-    float scale, halfShutter, maxRadius, minMotion;
+    int fw, fh, mode, maxS, soft;
+    float scale, shutter, maxRadius, minMotion, phase;
 };
 
 struct Pipelines {
@@ -282,9 +285,11 @@ bool BlurNatural(void* device, void* queue, const Frame& src, const Frame& dst,
         bp.mode = (fwd && bwd) ? 0 : (fwd ? 1 : 2);
         bp.maxS = std::max(1, p.maxSamples);
         bp.scale = (float)std::max(1, flowScale);
-        bp.halfShutter = 0.5f * p.shutter;
+        bp.shutter = p.shutter;
         bp.maxRadius = kMaxBlurRadius;
         bp.minMotion = p.minMotion;
+        bp.phase = p.phase;
+        bp.soft = p.soft ? 1 : 0;
         auto upload = [&](const Image* im) -> id<MTLBuffer> {
             if (!im || im->d.empty()) return [dev newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
             return [dev newBufferWithBytes:im->d.data() length:im->d.size() * sizeof(float) options:MTLResourceStorageModeShared];
@@ -338,13 +343,9 @@ static float MaxBlurLength(const Flow* fwd, const Flow* bwd, int flowScale, cons
     const float scale = (float)std::max(1, flowScale);
     float m = 0.f;
     for (size_t i = 0; i < any.u.d.size(); ++i) {
-        float vx, vy;
-        if (fwd && bwd) { vx = 0.5f * (fwd->u.d[i] - bwd->u.d[i]); vy = 0.5f * (fwd->v.d[i] - bwd->v.d[i]); }
-        else if (fwd)   { vx = fwd->u.d[i]; vy = fwd->v.d[i]; }
-        else            { vx = -bwd->u.d[i]; vy = -bwd->v.d[i]; }
-        float l = std::sqrt(vx * vx + vy * vy) * scale;
-        if (p.minMotion > 0.f) l = std::max(0.f, l - p.minMotion);
-        m = std::max(m, l * 0.5f * p.shutter);
+        const float fu = fwd ? fwd->u.d[i] * scale : 0.f, fv = fwd ? fwd->v.d[i] * scale : 0.f;
+        const float bu = bwd ? bwd->u.d[i] * scale : 0.f, bv = bwd ? bwd->v.d[i] * scale : 0.f;
+        m = std::max(m, MakeBlurPath(fwd != nullptr, bwd != nullptr, fu, fv, bu, bv, p, kMaxBlurRadius).extent);
     }
     return m;
 }
@@ -373,9 +374,11 @@ bool BlurNaturalInPlace(void* device, void* queue, const Frame& frame,
         bp.mode = (fwd && bwd) ? 0 : (fwd ? 1 : 2);
         bp.maxS = std::max(1, p.maxSamples);
         bp.scale = (float)std::max(1, flowScale);
-        bp.halfShutter = 0.5f * p.shutter;
+        bp.shutter = p.shutter;
         bp.maxRadius = kMaxBlurRadius;
         bp.minMotion = p.minMotion;
+        bp.phase = p.phase;
+        bp.soft = p.soft ? 1 : 0;
         auto upload = [&](const Image* im) -> id<MTLBuffer> {
             if (!im || im->d.empty()) return [dev newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
             return [dev newBufferWithBytes:im->d.data() length:im->d.size() * sizeof(float) options:MTLResourceStorageModeShared];

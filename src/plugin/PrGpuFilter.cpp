@@ -300,13 +300,19 @@ private:
         if (ds < 1) ds = 1 / ds;
 
         int factor = (quality == QUALITY_DRAFT) ? 4 : (quality == QUALITY_HIGH ? 1 : 2);
-        factor = std::max(1, factor / std::max(1, static_cast<int>(ds + 0.5)));
+        // "Schnelle Vorschau": bei reduzierter Vorschau-Aufloesung Analyse relativ zum Vorschaubild
+        if (Num0(FMB_FAST_PREVIEW, ct) == 0) factor = std::max(1, factor / std::max(1, static_cast<int>(ds + 0.5)));
 
         fmb::BlurParams bp;
         bp.shutter = amount;
         bp.maxSamples = std::max(3, samples);
         bp.minMotion = static_cast<float>(Num0(FMB_MIN_MOTION, ct) / ds);
         bp.mode = fmb::kBlurNatural;
+        {
+            const int ph = Pop(FMB_SHUTTER_PHASE, ct);
+            bp.phase = ph == PHASE_LEADING ? 1.f : (ph == PHASE_TRAILING ? -1.f : 0.f);
+            bp.soft = Num0(FMB_SHUTTER_SOFT, ct) != 0;
+        }
 
         fmb::FlowParams fp;
         fp.smoothRadius = smoothing;
@@ -327,7 +333,7 @@ private:
             std::lock_guard<std::mutex> l(mMutex);
             if (CacheEntry* e = FindCache(rp->inSequenceTime, tol, curLuma.w, curLuma.h, factor, alphaWeight)) {
                 // Inhalt geaendert (z. B. Korrektur darunter): Zwischenspeicher verwerfen
-                if (MeanAbsDiff(e->luma, curLuma) > 0.003) mCache.clear();
+                if (MeanAbsDiff(e->luma, curLuma) > 0.003) { mCache.clear(); mFwds.clear(); }
             }
             PutCache(rp->inSequenceTime, tol, curLuma, curAlpha, factor, alphaWeight);
         }
@@ -402,6 +408,7 @@ private:
 
         fmb::Flow fwd, bwd;
         std::string what;
+        bool reusedB = false;
         if (cameraMode) {
             fmb::CameraPrior prior; bool usePrior = false;
             const PrTime step = rp->inRenderTicksPerFrame;
@@ -409,15 +416,41 @@ private:
                 std::lock_guard<std::mutex> l(mMutex);
                 if (mHavePrior && std::llabs(rp->inSequenceTime - mPriorTime) <= 3 * step * rep) { prior = mPrior; usePrior = true; }
             }
+            // Rueckwaerts = Umkehrung der Vorwaertsbewegung, die ein frueheres Bild schon berechnet hat
+            const PrTime tNow = rp->inSequenceTime;
+            const PrTime tF = pF ? tNow + kDepOffsets[pF - nb] * ticks : 0;
+            const PrTime tB = pB ? tNow + kDepOffsets[pB - nb] * ticks : 0;
+            fmb::Flow hint; bool haveHint = false;
+            if (pB) {
+                std::lock_guard<std::mutex> l(mMutex);
+                for (FwdEntry& e : mFwds)
+                    if (std::llabs(e.from - tB) <= tol && std::llabs(e.to - tNow) <= tol && e.w == curLuma.w && e.h == curLuma.h &&
+                        e.factor == factor && e.aw == alphaWeight) {
+                        if (e.modelF && fmb::InvertHomography(e.Hf, prior.Hb)) {
+                            prior.validB = true;
+                            if (!usePrior) { prior.validF = false; usePrior = true; }
+                        }
+                        hint = e.fwd; haveHint = true; break;
+                    }
+            }
+            if (haveHint) { fmb::Flow inv; haveHint = fmb::InvertFlow(hint, inv) > 0.5f; hint = std::move(inv); }
             fmb::CameraInfo ci;
             fmb::CameraFlows(curLuma, pF ? &pF->luma : nullptr, pB ? &pB->luma : nullptr, fp, flowFn,
-                             pF ? &fwd : nullptr, pB ? &bwd : nullptr, &ci, usePrior ? &prior : nullptr);
+                             pF ? &fwd : nullptr, pB ? &bwd : nullptr, &ci, usePrior ? &prior : nullptr,
+                             haveHint ? &hint : nullptr);
             {
                 std::lock_guard<std::mutex> l(mMutex);
                 mPrior.validF = ci.modelF; mPrior.validB = ci.modelB;
                 std::copy(ci.Hf, ci.Hf + 9, mPrior.Hf); std::copy(ci.Hb, ci.Hb + 9, mPrior.Hb);
                 mPriorTime = rp->inSequenceTime; mHavePrior = ci.modelF || ci.modelB;
+                if (pF) {
+                    FwdEntry e; e.from = tNow; e.to = tF; e.w = curLuma.w; e.h = curLuma.h; e.factor = factor; e.aw = alphaWeight;
+                    e.fwd = fwd; std::copy(ci.Hf, ci.Hf + 9, e.Hf); e.modelF = ci.modelF;
+                    mFwds.push_back(std::move(e));
+                    if (mFwds.size() > 4) mFwds.erase(mFwds.begin());
+                }
             }
+            reusedB = ci.reusedB;
             what = "KAMERA MODELL " + Num(ci.sel.model * 100, 0) + "%";
         } else {
             auto one = [&](Nb* p, fmb::Flow& f) {
@@ -443,7 +476,7 @@ private:
             return std::to_string(static_cast<int>(std::chrono::duration<double, std::milli>(b - a).count()));
         };
         SetRenderStatus(std::to_string(cur.w) + "X" + std::to_string(cur.h) + (cur.isHalf ? " 16F" : " 32F") +
-                        "  " + std::to_string(inFrameCount) + " EIN " + std::to_string(lumaNew) + " NEU  " + what + (rep > 1 ? "  DOPPELT" : "") +
+                        "  " + std::to_string(inFrameCount) + " EIN " + std::to_string(lumaNew) + " NEU  " + (reusedB ? "UMKEHR  " : "") + what + (rep > 1 ? "  DOPPELT" : "") +
                         "  MS "  + ms(t0, tLuma) + " / " + ms(tLuma, tFlow) + " / " + ms(tFlow, tEnd));
         return suiteError_NoError;
     }
@@ -461,6 +494,10 @@ private:
     fmb::CameraPrior mPrior;
     PrTime mPriorTime = 0;
     bool mHavePrior = false;
+
+    // Vorwaertsbewegung frueherer Bilder (fuer die Rueckwaertsbewegung des naechsten)
+    struct FwdEntry { PrTime from = 0, to = 0; int w = 0, h = 0, factor = 0; float aw = 0; fmb::Flow fwd; double Hf[9]; bool modelF = false; };
+    std::vector<FwdEntry> mFwds;
 
     // Luminanz bereits gesehener Bilder (nach Sequenzzeit)
     struct CacheEntry { PrTime t = 0; int w = 0, h = 0, factor = 0; float aw = 0; fmb::Image luma; double alpha = 0; uint64_t use = 0; };

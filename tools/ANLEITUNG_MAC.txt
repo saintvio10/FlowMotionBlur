@@ -1,4 +1,4 @@
-Flow Motion Blur 2.1 - Plugin fuer Adobe Premiere Pro (macOS, Intel + Apple-Chip)
+Flow Motion Blur 2.2 - Plugin fuer Adobe Premiere Pro (macOS, Intel + Apple-Chip)
 ================================================================================
 
 INSTALLIEREN (ohne Admin-Rechte)

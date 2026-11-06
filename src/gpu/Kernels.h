@@ -245,22 +245,71 @@ __kernel void neighbor_max(__global const float* tmx, __global const float* tmy,
 }
 
 // Natuerlicher Modus: Mittel entlang der eigenen Bewegungsbahn
-__kernel void natural_blur(__global const float4* src, __global const float* VX, __global const float* VY,
-                           int W, int H, int maxS, __global float4* dst)
+// Bahn eines Pixels (wie MakeBlurPath in FlowCore.h)
+typedef struct { float vx, vy, extent, total; } Path;
+inline Path make_path(int mode, float fu, float fv, float bu, float bv, float shutter, float phase,
+                      float minMotion, float maxRadius)
+{
+    Path r;
+    if (mode == 0)      { r.vx = 0.5f * (fu - bu); r.vy = 0.5f * (fv - bv); }
+    else if (mode == 1) { r.vx = fu; r.vy = fv; }
+    else                { r.vx = -bu; r.vy = -bv; }
+    if (minMotion > 0.0f) {
+        float l = sqrt(r.vx * r.vx + r.vy * r.vy);
+        float k = l > minMotion ? (l - minMotion) / l : 0.0f;
+        r.vx *= k; r.vy *= k;
+    }
+    float hs = 0.5f * shutter;
+    float speed = sqrt(r.vx * r.vx + r.vy * r.vy);
+    float l0 = speed * fabs(hs * (-1.0f + phase)), l1 = speed * fabs(hs * (1.0f + phase));
+    float L = max(l0, l1);
+    if (L > maxRadius) { float k = maxRadius / L; r.vx *= k; r.vy *= k; l0 *= k; l1 *= k; L = maxRadius; }
+    r.extent = L; r.total = l0 + l1;
+    return r;
+}
+inline Path pixel_path(int x, int y, __global const float* fu, __global const float* fv,
+                       __global const float* bu, __global const float* bv, int fw, int fh, int mode, float scale,
+                       float shutter, float phase, float minMotion, float maxRadius)
+{
+    float inv = 1.0f / scale;
+    float fx = (x + 0.5f) * inv - 0.5f, fy = (y + 0.5f) * inv - 0.5f;
+    float a = 0, b = 0, c = 0, d = 0;
+    if (mode != 2) { a = smp(fu, fw, fh, fx, fy) * scale; b = smp(fv, fw, fh, fx, fy) * scale; }
+    if (mode != 1) { c = smp(bu, fw, fh, fx, fy) * scale; d = smp(bv, fw, fh, fx, fy) * scale; }
+    return make_path(mode, a, b, c, d, shutter, phase, minMotion, maxRadius);
+}
+// Ausdehnung je Pixel (fuer das Maximum ueber das Bild)
+__kernel void natural_extent(__global const float* fu, __global const float* fv,
+                             __global const float* bu, __global const float* bv,
+                             int fw, int fh, int mode, float scale, float shutter, float phase,
+                             float minMotion, float maxRadius, __global float* EX, int W, int H)
 {
     int x = get_global_id(0), y = get_global_id(1);
     if (x >= W || y >= H) return;
-    float vx = VX[y * W + x], vy = VY[y * W + x];
-    float len = sqrt(vx * vx + vy * vy);
-    if (len < 0.25f) { dst[y * W + x] = src[y * W + x]; return; }
-    int S = min(maxS, (int)ceil(2.0f * len) + 1);
+    EX[y * W + x] = pixel_path(x, y, fu, fv, bu, bv, fw, fh, mode, scale, shutter, phase, minMotion, maxRadius).extent;
+}
+__kernel void natural_blur(__global const float4* src, __global const float* fu, __global const float* fv,
+                           __global const float* bu, __global const float* bv,
+                           int fw, int fh, int mode, float scale, float shutter, float phase, int soft,
+                           float minMotion, float maxRadius, int W, int H, int maxS, __global float4* dst)
+{
+    int x = get_global_id(0), y = get_global_id(1);
+    if (x >= W || y >= H) return;
+    Path p = pixel_path(x, y, fu, fv, bu, bv, fw, fh, mode, scale, shutter, phase, minMotion, maxRadius);
+    if (p.extent < 0.25f) { dst[y * W + x] = src[y * W + x]; return; }
+    int S = min(maxS, (int)ceil(p.total) + 1);
     if ((S & 1) == 0) ++S;
-    float4 acc = (float4)(0.0f);
+    float hs = 0.5f * shutter;
+    float4 acc = (float4)(0.0f); float wsum = 0.0f;
     for (int i = 0; i < S; ++i) {
         float t = (S == 1) ? 0.0f : -1.0f + 2.0f * i / (S - 1);
-        acc += smp4(src, W, H, x + vx * t, y + vy * t);
+        float w = soft ? clamp((1.0f - fabs(t)) / 0.35f, 0.0f, 1.0f) : 1.0f;
+        if (w <= 0.0f) continue;
+        float sp = hs * (t + phase);
+        acc += w * smp4(src, W, H, x - p.vx * sp, y - p.vy * sp);
+        wsum += w;
     }
-    dst[y * W + x] = acc * (1.0f / S);
+    dst[y * W + x] = acc * (1.0f / wsum);
 }
 
 inline float cone(float dist, float len) { return len > 1e-4f ? clamp(1.0f - dist / len, 0.0f, 1.0f) : 0.0f; }

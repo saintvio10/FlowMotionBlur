@@ -7,6 +7,8 @@
 #include "FlowCore.h"
 
 #include <algorithm>
+#include <chrono>
+#include <limits>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -185,6 +187,9 @@ static void BoxFilter(const Image& src, int r, Image& dst)
     Image tmp; tmp.resize(w, h);
 
     // horizontal
+    // Kehrwerte der Fensterbreiten (Rand: kuerzere Fenster) einmal vorab
+    std::vector<double> invW(w);
+    for (int x = 0; x < w; ++x) invW[x] = 1.0 / (std::min(w - 1, x + r) - std::max(0, x - r) + 1);
     ParallelFor(0, h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             const float* s = src.row(y);
@@ -192,8 +197,7 @@ static void BoxFilter(const Image& src, int r, Image& dst)
             double sum = 0;
             for (int x = 0; x <= std::min(r, w - 1); ++x) sum += s[x];
             for (int x = 0; x < w; ++x) {
-                int a = std::max(0, x - r), b = std::min(w - 1, x + r);
-                t[x] = static_cast<float>(sum / (b - a + 1));
+                t[x] = static_cast<float>(sum * invW[x]);
                 if (x - r >= 0) sum -= s[x - r];
                 if (x + r + 1 < w) sum += s[x + r + 1];
             }
@@ -768,6 +772,57 @@ void ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     const float inv = 1.f / scale;
     const float half = 0.5f * p.shutter;
 
+    if (p.mode == kBlurNatural) {
+        // Jeder Pixel mittelt das Bild entlang seiner eigenen Bewegungsbahn
+        // (Gerade oder Bogen durch vorheriges/naechstes Bild, siehe MakeBlurPath).
+        std::vector<BlurPath> path(static_cast<size_t>(W) * H);
+        std::vector<float> rowMax(H, 0.f);
+        ParallelFor(0, H, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                float m = 0.f;
+                for (int x = 0; x < W; ++x) {
+                    const float fx = (x + 0.5f) * inv - 0.5f, fy = (y + 0.5f) * inv - 0.5f;
+                    float fu = 0, fv = 0, bu = 0, bv = 0;
+                    if (fwd) { fu = Sample(fwd->u, fx, fy) * scale; fv = Sample(fwd->v, fx, fy) * scale; }
+                    if (bwd) { bu = Sample(bwd->u, fx, fy) * scale; bv = Sample(bwd->v, fx, fy) * scale; }
+                    const BlurPath bpth = MakeBlurPath(fwd != nullptr, bwd != nullptr, fu, fv, bu, bv, p, kMaxBlurRadius);
+                    path[static_cast<size_t>(y) * W + x] = bpth;
+                    m = std::max(m, bpth.extent);
+                }
+                rowMax[y] = m;
+            }
+        });
+        float globalMax = 0.f;
+        for (float m : rowMax) globalMax = std::max(globalMax, m);
+        if (globalMax < 0.5f) { dst.d = src.d; return; }
+        const int maxS = std::max(1, p.maxSamples);
+        ParallelFor(0, H, [&](int y0, int y1) {
+            float c[4];
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const BlurPath& b = path[static_cast<size_t>(y) * W + x];
+                    const float* sx = src.px(x, y);
+                    float* o = dst.px(x, y);
+                    if (b.extent < 0.25f) { o[0] = sx[0]; o[1] = sx[1]; o[2] = sx[2]; o[3] = sx[3]; continue; }
+                    int S = std::min(maxS, static_cast<int>(std::ceil(b.total)) + 1);
+                    if ((S & 1) == 0) ++S;
+                    float acc[4] = { 0, 0, 0, 0 }, wsum = 0.f;
+                    for (int i = 0; i < S; ++i) {
+                        const float t = (S == 1) ? 0.f : -1.f + 2.f * i / (S - 1);
+                        const float w = ShutterWeight(t, p.soft);
+                        if (w <= 0.f) continue;
+                        const float sp = half * (t + p.phase);
+                        SampleRGBA(src, x - b.vx * sp, y - b.vy * sp, c);
+                        for (int k = 0; k < 4; ++k) acc[k] += w * c[k];
+                        wsum += w;
+                    }
+                    const float iw = 1.f / wsum;
+                    o[0] = acc[0] * iw; o[1] = acc[1] * iw; o[2] = acc[2] * iw; o[3] = acc[3] * iw;
+                }
+        });
+        return;
+    }
+
     // 1) Halbe Belichtungs-Strecke pro Pixel in voller Aufloesung.
     //    Geschwindigkeit = Mittel aus Vorwaerts- und (negiertem) Rueckwaertsfluss.
     Image VX, VY;
@@ -807,33 +862,6 @@ void ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     for (float m : rowMax) globalMax = std::max(globalMax, m);
     if (globalMax < 0.5f) { dst.d = src.d; return; }
 
-    if (p.mode == kBlurNatural) {
-        // Jeder Pixel mittelt das Bild entlang seiner eigenen Bewegungsbahn
-        // (gleichmaessige Belichtung von -halbe bis +halbe Verschlusszeit).
-        const int maxS = std::max(1, p.maxSamples);
-        ParallelFor(0, H, [&](int y0, int y1) {
-            float c[4];
-            for (int y = y0; y < y1; ++y)
-                for (int x = 0; x < W; ++x) {
-                    const float vx = VX.row(y)[x], vy = VY.row(y)[x];
-                    const float len = std::sqrt(vx * vx + vy * vy);
-                    const float* sx = src.px(x, y);
-                    float* o = dst.px(x, y);
-                    if (len < 0.25f) { o[0] = sx[0]; o[1] = sx[1]; o[2] = sx[2]; o[3] = sx[3]; continue; }
-                    int S = std::min(maxS, static_cast<int>(std::ceil(2.f * len)) + 1);
-                    if ((S & 1) == 0) ++S;
-                    float acc[4] = { 0, 0, 0, 0 };
-                    for (int i = 0; i < S; ++i) {
-                        float t = (S == 1) ? 0.f : -1.f + 2.f * i / (S - 1);
-                        SampleRGBA(src, x + vx * t, y + vy * t, c);
-                        for (int k = 0; k < 4; ++k) acc[k] += c[k];
-                    }
-                    const float inv = 1.f / S;
-                    o[0] = acc[0] * inv; o[1] = acc[1] * inv; o[2] = acc[2] * inv; o[3] = acc[3] * inv;
-                }
-        });
-        return;
-    }
 
     // 2) Kachel-Maximum (dominante Bewegung je Kachel) und 3x3-Nachbarschaftsmaximum.
     const int K = std::max(4, static_cast<int>(std::ceil(globalMax)));
@@ -1264,43 +1292,48 @@ void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
     if (mf && mf->empty()) mf = nullptr;
     if (mb && mb->empty()) mb = nullptr;
 
-    // Fotometrischer Fehler eines Kandidaten (beide Richtungen zusammen)
-    auto cost = [&](const Flow* cf, const Flow* cb, Image& out) {
-        Image raw; raw.resize(w, h);
-        ParallelFor(0, h, [&](int y0, int y1) {
-            for (int y = y0; y < y1; ++y)
-                for (int x = 0; x < w; ++x) {
-                    // Mittel ueber die Richtungen, deren Ziel im Bild liegt. Zeigt die
-                    // Bewegung aus dem Bild (Inhalt verlaesst das Bild, z. B. unten beim
-                    // Vorwaertsflug), zaehlt nur die andere Richtung - kein Strafwert.
-                    float e = 0; int n = 0;
-                    const float c0 = I0.row(y)[x];
-                    if (Inext) {
-                        float u = cf ? cf->u.row(y)[x] : 0.f, v = cf ? cf->v.row(y)[x] : 0.f;
-                        float tx = x + u, ty = y + v;
-                        if (tx >= 0 && ty >= 0 && tx <= w - 1 && ty <= h - 1) { e += std::fabs(Sample(*Inext, tx, ty) - c0); ++n; }
-                    }
-                    if (Iprev) {
-                        float u = cb ? cb->u.row(y)[x] : 0.f, v = cb ? cb->v.row(y)[x] : 0.f;
-                        float tx = x + u, ty = y + v;
-                        if (tx >= 0 && ty >= 0 && tx <= w - 1 && ty <= h - 1) { e += std::fabs(Sample(*Iprev, tx, ty) - c0); ++n; }
-                    }
-                    raw.row(y)[x] = n ? e / n : 0.3f; // fuehrt in beide Richtungen aus dem Bild
-                }
-        });
-        SoftFilter(raw, 6, out);
-    };
-
-    Image cLocal, cZero, cModel;
-    cost(fwd, bwd, cLocal);
-    cost(nullptr, nullptr, cZero);
+    // Fotometrischer Fehler der Kandidaten (Tracking, keine Bewegung, Modell) in
+    // einem Durchgang. Mittel ueber die Richtungen, deren Ziel im Bild liegt. Zeigt
+    // die Bewegung aus dem Bild (Inhalt verlaesst das Bild, z. B. unten beim
+    // Vorwaertsflug), zaehlt nur die andere Richtung - kein Strafwert.
     const bool haveModel = (Inext ? mf != nullptr : true) && (Iprev ? mb != nullptr : true);
-    if (haveModel) cost(mf, mb, cModel);
+    Image rawL, rawZ, rawM;
+    rawL.resize(w, h); rawZ.resize(w, h); if (haveModel) rawM.resize(w, h);
+    ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float c0 = I0.row(y)[x];
+                auto err = [&](const Image& I1, float u, float v, float& e, int& n) {
+                    const float tx = x + u, ty = y + v;
+                    if (tx >= 0 && ty >= 0 && tx <= w - 1 && ty <= h - 1) { e += std::fabs(Sample(I1, tx, ty) - c0); ++n; }
+                };
+                float eL = 0, eZ = 0, eM = 0; int nL = 0, nZ = 0, nM = 0;
+                if (Inext) {
+                    err(*Inext, fwd->u.row(y)[x], fwd->v.row(y)[x], eL, nL);
+                    eZ += std::fabs(Inext->row(y)[x] - c0); ++nZ;
+                    if (haveModel) err(*Inext, mf->u.row(y)[x], mf->v.row(y)[x], eM, nM);
+                }
+                if (Iprev) {
+                    err(*Iprev, bwd->u.row(y)[x], bwd->v.row(y)[x], eL, nL);
+                    eZ += std::fabs(Iprev->row(y)[x] - c0); ++nZ;
+                    if (haveModel) err(*Iprev, mb->u.row(y)[x], mb->v.row(y)[x], eM, nM);
+                }
+                rawL.row(y)[x] = nL ? eL / nL : 0.3f; // fuehrt in beide Richtungen aus dem Bild
+                rawZ.row(y)[x] = nZ ? eZ / nZ : 0.3f;
+                if (haveModel) rawM.row(y)[x] = nM ? eM / nM : 0.3f;
+            }
+    });
+    Image cLocal, cZero, cModel;
+    SoftFilter(rawL, 6, cLocal);
+    SoftFilter(rawZ, 6, cZero);
+    if (haveModel) SoftFilter(rawM, 6, cModel);
 
     // Modell leicht bevorzugen (glatt, flackerfrei); "keine Bewegung" nur, wenn
     // es deutlich besser passt (z. B. Himmel, unendlich weit entfernt).
-    long nM = 0, nL = 0, nZ = 0;
-    for (int y = 0; y < h; ++y)
+    std::vector<long> rowM(h, 0), rowL(h, 0), rowZ(h, 0);
+    ParallelFor(0, h, [&](int ya, int yb) {
+      for (int y = ya; y < yb; ++y) {
+        long& nM = rowM[y]; long& nL = rowL[y]; long& nZ = rowZ[y];
         for (int x = 0; x < w; ++x) {
             float l = cLocal.row(y)[x], z = cZero.row(y)[x], m = haveModel ? cModel.row(y)[x] * 0.55f : 1e9f;
             int pick = 1; float best = l;
@@ -1316,6 +1349,10 @@ void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
                 if (bwd) { bwd->u.row(y)[x] = 0; bwd->v.row(y)[x] = 0; }
             } else ++nL;
         }
+      }
+    });
+    long nM = 0, nL = 0, nZ = 0;
+    for (int y = 0; y < h; ++y) { nM += rowM[y]; nL += rowL[y]; nZ += rowZ[y]; }
     // Uebergaenge zwischen den Kandidaten leicht glaetten
     for (Flow* f : { fwd, bwd }) {
         if (!f) continue;
@@ -1348,9 +1385,13 @@ static bool TryPrior(const AlignPyr& A, const AlignPyr& B, const double* Hp, dou
 }
 
 void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowParams& p,
-                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info, const CameraPrior* prior)
+                 const FlowFn& flowFn, Flow* fwd, Flow* bwd, CameraInfo* info, const CameraPrior* prior,
+                 const Flow* bwdHint)
 {
     CameraInfo ci;
+    using Clk = std::chrono::steady_clock;
+    auto tA = Clk::now();
+    auto lapMs = [&]() { auto n = Clk::now(); double d = std::chrono::duration<double, std::milli>(n - tA).count(); tA = n; return d; };
     Flow mf, mb;
     double Hf[9], Hb[9];
     float fdx = 0, fdy = 0, bdx = 0, bdy = 0;
@@ -1405,6 +1446,7 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
     // Feines Tracking (Parallaxe) startet am Kameramodell. Es liefert nur noch
     // kleine Korrekturen und laeuft daher - samt Auffuellen - in halber
     // Aufloesung; das Kameramodell selbst bleibt in voller Genauigkeit.
+    ci.msModel = lapMs();
     const bool half = p.localHalf && std::min(I0.w, I0.h) >= 200;
     Image I0h, Inh, Iph;
     if (half) {
@@ -1442,18 +1484,72 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
         }
         flowFn(L0, In1, q, out);
     };
+    // Rueckwaerts schon bekannt (Umkehrung vom vorherigen Bild)? Nur mit Kameramodell
+    // zum Fuellen der Luecken.
+    const bool hintB = useB && ci.modelB && bwdHint && bwdHint->w() == I0.w && bwdHint->h() == I0.h;
     if (useF) track(half ? Inh : *In, lf, mf, modelLF, ci.modelF, Hf, fdx, fdy);
-    if (useB) track(half ? Iph : *Ip, lb, mb, modelLB, ci.modelB, Hb, bdx, bdy);
-    RefineFlows(L0, useF ? &lf : nullptr, useB ? &lb : nullptr);
+    if (useB && !hintB) track(half ? Iph : *Ip, lb, mb, modelLB, ci.modelB, Hb, bdx, bdy);
+    RefineFlows(L0, useF ? &lf : nullptr, (useB && !hintB) ? &lb : nullptr);
     if (useF) { if (half) upsample(lf, *fwd); else *fwd = lf; }
-    if (useB) { if (half) upsample(lb, *bwd); else *bwd = lb; }
+    if (useB && !hintB) { if (half) upsample(lb, *bwd); else *bwd = lb; }
+    if (hintB) {
+        HomographyField(Hb, I0.w, I0.h, mb);
+        bwd->u.resize(I0.w, I0.h); bwd->v.resize(I0.w, I0.h);
+        for (size_t i = 0; i < mb.u.d.size(); ++i) {
+            const float u = bwdHint->u.d[i], v = bwdHint->v.d[i];
+            const bool ok = std::isfinite(u) && std::isfinite(v);
+            bwd->u.d[i] = ok ? u : mb.u.d[i];
+            bwd->v.d[i] = ok ? v : mb.v.d[i];
+        }
+        ci.reusedB = true;
+    }
+    ci.msTrack = lapMs();
     SelectCandidates(I0, In, Ip, In ? fwd : nullptr, Ip ? bwd : nullptr,
                      ci.modelF ? &mf : nullptr, ci.modelB ? &mb : nullptr, &ci.sel);
+    ci.msSelect = lapMs();
     if (useF && useB && p.occlusions) ci.occluded = ResolveOcclusions(I0, *In, *Ip, *fwd, *bwd,
                                                       ci.modelF && ci.modelB ? &mf : nullptr, ci.modelF && ci.modelB ? &mb : nullptr);
+    ci.msOcclusion = lapMs();
     if (info) *info = ci;
 }
 
+
+float InvertFlow(const Flow& f, Flow& out)
+{
+    const int w = f.w(), h = f.h();
+    out.u.resize(w, h); out.v.resize(w, h);
+    if (w <= 0 || h <= 0) return 0.f;
+    // Jede Stelle von A wird bilinear an ihr Ziel in B verteilt ("Splatting").
+    // Treffen mehrere Stellen dasselbe Ziel (Verdeckung), gewinnt die mit der
+    // groesseren Bewegung (naeher an der Kamera) ueber ein starkes Gewicht.
+    std::vector<float> su(static_cast<size_t>(w) * h, 0.f), sv(su.size(), 0.f), sw(su.size(), 0.f);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const float u = f.u.row(y)[x], v = f.v.row(y)[x];
+            const float tx = x + u, ty = y + v;
+            const int x0 = static_cast<int>(std::floor(tx)), y0 = static_cast<int>(std::floor(ty));
+            const float ax = tx - x0, ay = ty - y0;
+            const float pri = 1.f + 0.25f * std::sqrt(u * u + v * v); // Vordergrund bevorzugen
+            const float wq = pri * pri * pri * pri;
+            for (int k = 0; k < 4; ++k) {
+                const int xx = x0 + (k & 1), yy = y0 + (k >> 1);
+                if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                const float wb = ((k & 1) ? ax : 1.f - ax) * ((k >> 1) ? ay : 1.f - ay) * wq;
+                const size_t i = static_cast<size_t>(yy) * w + xx;
+                su[i] -= u * wb; sv[i] -= v * wb; sw[i] += wb;
+            }
+        }
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    size_t valid = 0;
+    // Mindestgewicht relativ zur Prioritaet: Stellen mit nur einem Hauch Abdeckung gelten als Luecke
+    for (size_t i = 0; i < su.size(); ++i) {
+        const float u = sw[i] > 0.f ? su[i] / sw[i] : 0.f, v = sw[i] > 0.f ? sv[i] / sw[i] : 0.f;
+        const float pri = 1.f + 0.25f * std::sqrt(u * u + v * v);
+        if (sw[i] > 0.3f * pri * pri * pri * pri) { out.u.d[i] = u; out.v.d[i] = v; ++valid; }
+        else { out.u.d[i] = nan; out.v.d[i] = nan; }
+    }
+    return static_cast<float>(valid) / su.size();
+}
 
 float ResolveOcclusions(const Image& I0, const Image& In, const Image& Ip, Flow& fwd, Flow& bwd,
                         const Flow* mf, const Flow* mb)

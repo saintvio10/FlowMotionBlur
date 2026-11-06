@@ -388,6 +388,16 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_CHECKBOXX("Premiere-GPU (Metal)", FALSE, 0, PR_GPU_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Verschluss-Lage", 3, PHASE_CENTER,
+                 "Mittig|Vorlaufend (jetzt bis spaeter)|Nachlaufend (frueher bis jetzt)", SHUTTER_PHASE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Weicher Verschluss", FALSE, 0, SHUTTER_SOFT_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Schnelle Vorschau", TRUE, 0, FAST_PREVIEW_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Ansicht", 3, VIEW_RESULT, "Ergebnis|Bewegungsvektoren|Diagnose", VIEW_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
@@ -611,7 +621,27 @@ struct InstanceState {
     uint64_t tick = 0;
     int rep = 1; A_long repTime = 0;          // erkanntes Wiederholungsmuster
     fmb::CameraPrior prior; A_long priorTime = 0; bool havePrior = false;
-    long hits = 0, misses = 0, flushes = 0;
+    long hits = 0, misses = 0, flushes = 0, reused = 0;
+    // Vorwaertsbewegung der letzten Bilder: Rueckwaerts des naechsten Bildes ist deren Umkehrung
+    struct FwdEntry { A_long from = 0, to = 0; int w = 0, h = 0, factor = 0; float aw = 0;
+                      fmb::Flow fwd; double Hf[9]; bool modelF = false; uint64_t use = 0; };
+    std::vector<FwdEntry> fwds;
+    FwdEntry* FindFwd(A_long from, A_long to, int w, int h, int factor, float aw)
+    {
+        for (FwdEntry& e : fwds)
+            if (std::labs(static_cast<long>(e.from - from)) <= tol && std::labs(static_cast<long>(e.to - to)) <= tol &&
+                e.w == w && e.h == h && e.factor == factor && e.aw == aw) { e.use = ++tick; return &e; }
+        return nullptr;
+    }
+    void PutFwd(FwdEntry&& e)
+    {
+        e.use = ++tick;
+        fwds.push_back(std::move(e));
+        while (fwds.size() > 6) {
+            auto oldest = std::min_element(fwds.begin(), fwds.end(), [](const FwdEntry& x, const FwdEntry& y) { return x.use < y.use; });
+            fwds.erase(oldest);
+        }
+    }
 
     static constexpr size_t kMaxBytes = 192u << 20; // max. ~192 MB je Instanz
 
@@ -818,6 +848,11 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         // Mindestbewegung in Pixeln der vollen Aufloesung -> auf Vorschau umrechnen
         bp.minMotion = static_cast<float>(params[FMB_MIN_MOTION]->u.fs_d.value / DownsampleX(in_data));
         bp.mode = (params[FMB_BLUR_MODE]->u.pd.value == MODE_OBJECTS) ? fmb::kBlurObjects : fmb::kBlurNatural;
+        {
+            const int ph = params[FMB_SHUTTER_PHASE]->u.pd.value;
+            bp.phase = ph == PHASE_LEADING ? 1.f : (ph == PHASE_TRAILING ? -1.f : 0.f);
+            bp.soft = params[FMB_SHUTTER_SOFT]->u.bd.value != 0;
+        }
         fmb::RGBAImage result;
         result.d = Buffers().Get(nPix);
         PooledImages pooled{ &cur, &result };
@@ -838,8 +873,12 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         // --- Variante 2: automatisches Tracking ----------------------------
         int factor = (quality == QUALITY_DRAFT) ? 4 : (quality == QUALITY_HIGH ? 1 : 2);
         // Bei reduzierter Vorschau-Aufloesung ist das Bild schon kleiner.
+        // Bei reduzierter Vorschau-Aufloesung ist das Bild schon kleiner. Ohne "Schnelle
+        // Vorschau" wird die Analyse-Aufloesung relativ zum vollen Bild gehalten, mit
+        // ihr relativ zum Vorschaubild (1/2 Vorschau -> Analyse viermal schneller).
         const int ds = std::max(1, static_cast<int>(DownsampleX(in_data) + 0.5));
-        factor = std::max(1, factor / ds);
+        const bool fastPreview = params[FMB_FAST_PREVIEW]->u.bd.value != 0;
+        if (!fastPreview) factor = std::max(1, factor / ds);
 
         fmb::FlowParams fp;
         fp.smoothRadius = smoothing;
@@ -973,7 +1012,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                 if (e->luma.d.size() == curLuma.d.size())
                     for (size_t i = 0; i < curLuma.d.size(); i += 7) dd += std::fabs(e->luma.d[i] - curLuma.d[i]);
                 dd /= std::max<size_t>(1, curLuma.d.size() / 7);
-                if (dd > 0.003) { state->frames.clear(); state->havePrior = false; cacheFlushed = true; ++state->flushes; }
+                if (dd > 0.003) { state->frames.clear(); state->fwds.clear(); state->havePrior = false; cacheFlushed = true; ++state->flushes; }
             }
             state->Put(tNow, cur.w, cur.h, factor, alphaWeight, curLuma, curAlpha);
         }
@@ -1067,25 +1106,53 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             fmb::CameraInfo ci;
             // Kamerabewegung des vorherigen Bildes als Startwert (falls nah genug)
             fmb::CameraPrior prior; bool usePrior = false;
+            // Zeitschluessel (Bildmitte) von aktuellem und benachbarten Bildern
+            const A_long keyNow = in_data->current_time + timeOffset + half;
+            const A_long keyF = keyNow + dirSign * step * kF, keyB = keyNow - dirSign * step * kB;
+            fmb::Flow hint; bool haveHint = false;
             if (state) {
                 std::lock_guard<std::mutex> lock(state->m);
                 if (state->havePrior && std::labs(in_data->current_time - state->priorTime) <= 3 * step * rep) {
                     prior = state->prior; usePrior = true;
                 }
+                // Hat ein frueheres Bild schon die Bewegung vom Rueckwaerts-Nachbarn zu
+                // diesem Bild berechnet? Dann ist rueckwaerts deren Umkehrung (exakt auch
+                // fuer das Kameramodell).
+                if (haveB) {
+                    if (InstanceState::FwdEntry* e = state->FindFwd(keyB, keyNow, curLuma.w, curLuma.h, factor, alphaWeight)) {
+                        if (e->modelF && fmb::InvertHomography(e->Hf, prior.Hb)) {
+                            prior.validB = true;
+                            if (!usePrior) { prior.validF = false; usePrior = true; }
+                        }
+                        hint.u = e->fwd.u; hint.v = e->fwd.v; haveHint = true;
+                    }
+                }
+            }
+            if (haveHint) {
+                fmb::Flow inv;
+                haveHint = fmb::InvertFlow(hint, inv) > 0.5f;
+                hint = std::move(inv);
             }
             fmb::CameraFlows(curLuma, haveF ? &lumF : nullptr, haveB ? &lumB : nullptr, fp,
                              [&](const fmb::Image& a, const fmb::Image& b, const fmb::FlowParams& q, fmb::Flow& o) {
                                  eng.Flow(a, b, q, nullptr, o);
                              },
                              haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci,
-                             usePrior ? &prior : nullptr);
+                             usePrior ? &prior : nullptr, haveHint ? &hint : nullptr);
             camInfo = ci;
             if (state) {
-                // Kamerabewegung fuer das naechste Bild merken
+                // Kamerabewegung und Vorwaertsbewegung fuer die naechsten Bilder merken
                 std::lock_guard<std::mutex> lock(state->m);
                 state->prior.validF = ci.modelF; state->prior.validB = ci.modelB;
                 std::copy(ci.Hf, ci.Hf + 9, state->prior.Hf); std::copy(ci.Hb, ci.Hb + 9, state->prior.Hb);
                 state->priorTime = in_data->current_time; state->havePrior = ci.modelF || ci.modelB;
+                if (ci.reusedB) ++state->reused;
+                if (haveF) {
+                    InstanceState::FwdEntry e;
+                    e.from = keyNow; e.to = keyF; e.w = curLuma.w; e.h = curLuma.h; e.factor = factor; e.aw = alphaWeight;
+                    e.fwd = fwd; std::copy(ci.Hf, ci.Hf + 9, e.Hf); e.modelF = ci.modelF;
+                    state->PutFwd(std::move(e));
+                }
             }
             if (haveF) scaleFlow(fwd, rep);
             if (haveB) scaleFlow(bwd, rep);
@@ -1139,6 +1206,12 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                         (selfDiff > 0.01 ? "  -> ZEITBASIS ABWEICHEND" : ""));
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
             L.push_back("KAMERA: " + modelState);
+            if (cameraMode)
+                L.push_back("ANALYSE MS: MODELL " + Num(camInfo.msModel, 0) + "  TRACKING " + Num(camInfo.msTrack, 0) +
+                            "  AUSWAHL " + Num(camInfo.msSelect, 0) + "  VERDECKUNG " + Num(camInfo.msOcclusion, 0) +
+                            "  RUECKW. UEBERNOMMEN: " + (camInfo.reusedB ? "JA" : "NEIN") +
+                            (state ? " (" + std::to_string(state->reused) + " MAL)" : std::string()));
+            L.push_back("VORSCHAU-ANALYSE: " + std::string(fastPreview ? "SCHNELL" : "VOLL"));
             if (cameraMode)
                 L.push_back(std::string("STARTWERT VOM LETZTEN BILD: ") + (camInfo.priorUsedF || camInfo.priorUsedB ? "JA" : "NEIN") +
                             "  VERDECKUNG " + Num(camInfo.occluded * 100, 1) + "%");

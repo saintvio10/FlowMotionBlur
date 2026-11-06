@@ -42,6 +42,8 @@ target_link_libraries(fmb_test PRIVATE fmb_core)
 add_executable(fmb_test_occlusion tests/test_occlusion.cpp)
 target_link_libraries(fmb_test_occlusion PRIVATE fmb_core)
 add_executable(fmb_test_drone tests/test_drone.cpp)
+add_executable(fmb_test_sequence tests/test_sequence.cpp)
+target_link_libraries(fmb_test_sequence PRIVATE fmb_core)
 target_link_libraries(fmb_test_drone PRIVATE fmb_core)
 
 # Metal-Kerne fuer Premieres GPU-Weg (nur Mac) + Vergleichstest mit der CPU

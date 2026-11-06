@@ -1,6 +1,6 @@
 # Flow Motion Blur – Plugin für Premiere Pro (und After Effects)
 
-**Version 2.1**
+**Version 2.2**
 
 Automatische, vektorbasierte Bewegungsunschärfe: Das Plugin verfolgt jeden Pixel
 vom vorherigen zum nächsten Frame (optischer Fluss) und verwischt das Bild entlang
@@ -33,6 +33,9 @@ dieser Bewegung. Einfach auf einen Clip ziehen – fertig.
 | **Vektor-Glättung** | Glättet das Bewegungsfeld; höher bei unruhigen Ergebnissen |
 | **RGB+A-Tracking** | Nutzt den Alphakanal für die Analyse mit |
 | **GPU verwenden** | Rechnet per OpenCL auf der Grafikkarte, sonst automatisch CPU |
+| **Verschluss-Lage** | **Mittig** (Standard): Unschärfe vor und nach dem Bild. **Vorlaufend**: vom Bild bis zum nächsten (wie eine Kamera, die beim Bild öffnet). **Nachlaufend**: vom vorherigen bis zum Bild |
+| **Weicher Verschluss** | Blendet die Belichtung an den Enden weich ein und aus: weichere Schlieren ohne harte Enden |
+| **Schnelle Vorschau** | Bei reduzierter Wiedergabe-Auflösung in Premiere (½, ¼) wird die Analyse entsprechend gröber, die Vorschau also deutlich schneller. Export in voller Auflösung ist davon nicht betroffen |
 | **Premiere-GPU (Metal)** | Nur Mac: nutzt Premieres eigene GPU-Schnittstelle, die Bilder bleiben auf der Grafikkarte. Standardmäßig aus (siehe unten) |
 | **Ansicht** | „Bewegungsvektoren“ zeigt Richtung (Farbe) und Stärke (Helligkeit); „Diagnose“ schreibt Pixelformat, Zeitschritte, Status der Nachbarframes und des Kameramodells ins Bild |
 | **Vektor-Quelle** | „Automatisch (Tracking)“ oder „Vektor-Ebene“ |

@@ -178,7 +178,7 @@ static State* CreateState()
 
     const char* names[] = { "downscale", "gradients", "box_h", "box_v", "warp_products", "solve",
                             "median3", "upsample_flow", "apply_guides", "velocity", "row_max",
-                            "tile_max", "neighbor_max", "reconstruct", "natural_blur" };
+                            "tile_max", "neighbor_max", "reconstruct", "natural_blur", "natural_extent" };
     for (const char* n : names) {
         cl_kernel k = api->CreateKernel(s->prog, n, &err);
         if (err != kCL_SUCCESS || !k) return nullptr;
@@ -430,6 +430,26 @@ bool ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     const size_t n = static_cast<size_t>(W) * H;
     Buf VX = S.Alloc(n), VY = S.Alloc(n);
     const float scale = static_cast<float>(std::max(1, flowScale));
+    if (p.mode == kBlurNatural) {
+        // Ausdehnung je Pixel -> Maximum je Zeile (row_max mit VY = 0)
+        S.Run("natural_extent", W, H, fu, fv, bu, bv, fw, fh, mode, scale, p.shutter, p.phase,
+              p.minMotion, kMaxBlurRadius, VX, W, H);
+        Buf zero = S.Zeros(n);
+        Buf rm = S.Alloc(H);
+        S.Run("row_max", H, 1, VX, zero, W, H, rm);
+        std::vector<float> rowMax(H, 0.f);
+        S.Download(rm, rowMax.data(), rowMax.size());
+        if (!S.ok()) return false;
+        float globalMax = 0.f;
+        for (float m : rowMax) globalMax = std::max(globalMax, m);
+        dst.ensure(W, H);
+        if (globalMax < 0.5f) { dst.d = src.d; return true; }
+        Buf out = S.Alloc(n * 4);
+        S.Run("natural_blur", W, H, img, fu, fv, bu, bv, fw, fh, mode, scale, p.shutter, p.phase,
+              p.soft ? 1 : 0, p.minMotion, kMaxBlurRadius, W, H, std::max(1, p.maxSamples), out);
+        S.Download(out, dst.d.data(), dst.d.size());
+        return S.ok();
+    }
     S.Run("velocity", W, H, fu, fv, bu, bv, fw, fh, mode, scale, 0.5f * p.shutter, kMaxBlurRadius, p.minMotion, VX, VY, W, H);
 
     Buf rm = S.Alloc(H);
@@ -442,13 +462,6 @@ bool ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
 
     dst.ensure(W, H); // wird vollstaendig ueberschrieben
     if (globalMax < 0.5f) { dst.d = src.d; return true; }
-
-    if (p.mode == kBlurNatural) {
-        Buf out = S.Alloc(n * 4);
-        S.Run("natural_blur", W, H, img, VX, VY, W, H, std::max(1, p.maxSamples), out);
-        S.Download(out, dst.d.data(), dst.d.size());
-        return S.ok();
-    }
 
     const int K = std::max(4, static_cast<int>(std::ceil(globalMax)));
     const int TW = (W + K - 1) / K, TH = (H + K - 1) / K;

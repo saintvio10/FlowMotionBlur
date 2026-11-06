@@ -139,16 +139,20 @@ int main()
             }
 
             // --- Unschaerfe ---
-            struct Case { const char* name; bool f, b; float shutter, minMotion; int maxS; };
+            struct Case { const char* name; bool f, b; float shutter, minMotion; int maxS; float phase; bool soft; };
             const Case cases[] = {
-                { "vor+rueck", true, true, 0.5f, 0.f, 32 },
-                { "nur vor", true, false, 1.0f, 0.f, 32 },
-                { "nur rueck", false, true, 0.7f, 0.f, 16 },
-                { "mindestbewegung", true, true, 2.0f, 5.f, 64 },
-                { "stark", true, true, 4.0f, 0.f, 9 },
+                { "vor+rueck", true, true, 0.5f, 0.f, 32, 0.f, false },
+                { "nur vor", true, false, 1.0f, 0.f, 32, 0.f, false },
+                { "nur rueck", false, true, 0.7f, 0.f, 16, 0.f, false },
+                { "mindestbewegung", true, true, 2.0f, 5.f, 64, 0.f, false },
+                { "stark", true, true, 4.0f, 0.f, 9, 0.f, false },
+                { "vorlaufend", true, true, 0.5f, 0.f, 32, 1.f, false },
+                { "nachlauf weich", true, true, 1.5f, 0.f, 32, -1.f, true },
+                { "mittig weich", true, true, 2.0f, 0.f, 32, 0.f, true },
             };
             for (const Case& c : cases) {
                 BlurParams bp; bp.shutter = c.shutter; bp.minMotion = c.minMotion; bp.maxSamples = c.maxS; bp.mode = kBlurNatural;
+                bp.phase = c.phase; bp.soft = c.soft;
                 RGBAImage out; out.resize(W, H);
                 ApplyMotionBlur(pm, c.f ? &fwd : nullptr, c.b ? &bwd : nullptr, scale, bp, out);
                 id<MTLBuffer> b = Upload(dev, img, W, H, rowBytes, half);

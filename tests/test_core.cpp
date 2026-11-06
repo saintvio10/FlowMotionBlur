@@ -206,6 +206,21 @@ int main(int argc, char** argv)
             double m2 = 0; for (size_t i = 0; i < c2.d.size(); ++i) m2 = std::max(m2, (double)std::fabs(c2.d[i] - g2.d[i]));
             std::printf("  Blur Mindestbewegung 3 px: max. Abweichung GPU/CPU %.4f\n", m2);
         }
+        // Verschluss-Lage und weicher Verschluss: CPU und GPU gleich
+        {
+            struct V { const char* name; float phase; bool soft; float shutter; };
+            const V vs[] = { { "vorlaufend", 1.f, false, 0.5f }, { "nachlaufend weich", -1.f, true, 1.5f },
+                             { "mittig weich", 0.f, true, 2.0f }, { "vorlaufend lang", 1.f, false, 3.0f } };
+            for (const V& v : vs) {
+                BlurParams bv; bv.phase = v.phase; bv.soft = v.soft; bv.shutter = v.shutter;
+                RGBAImage c2, g2;
+                ApplyMotionBlur(cur, &cf, &cb, scale, bv, c2);
+                if (!gpu::ApplyMotionBlur(cur, &cf, &cb, scale, bv, g2)) { std::printf("GPU-Blur (%s) FEHLGESCHLAGEN\n", v.name); return 1; }
+                double m2 = 0; for (size_t i = 0; i < c2.d.size(); ++i) m2 = std::max(m2, (double)std::fabs(c2.d[i] - g2.d[i]));
+                std::printf("  Blur %-20s max. Abweichung GPU/CPU %.4f\n", v.name, m2);
+                if (m2 > 0.01) { std::printf("  -> ZU GROSS\n"); return 1; }
+            }
+        }
         // nur eine Richtung (Clip-Anfang/-Ende)
         ApplyMotionBlur(cur, &cf, nullptr, scale, bp, cpuB);
         gpu::ApplyMotionBlur(cur, &cf, nullptr, scale, bp, gpuB);
