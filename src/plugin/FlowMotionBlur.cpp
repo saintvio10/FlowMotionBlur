@@ -677,12 +677,35 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         fmb::Flow fwd, bwd;
         fmb::Image lumF, lumB;
         NbInfo infoF, infoB;
-        bool haveF = NeighbourFlow(in_data, +step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, infoF, !cameraMode, lumF);
-        if (err) return err;
-        if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
-        bool haveB = NeighbourFlow(in_data, -step, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, infoB, !cameraMode, lumB);
-        if (err) return err;
-        if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
+        // Doppelte Bilder (Material mit weniger fps als die Sequenz, langsame
+        // Abschnitte einer Speed Ramp): Ist der Nachbar identisch mit dem
+        // aktuellen Bild, das naechste wirklich andere Bild holen (bis 4 weiter)
+        // und die Bewegung spaeter durch den Abstand teilen.
+        const double kDup = 0.0025; // mittlerer Helligkeitsunterschied unter 0.25 % = gleiches Bild
+        int kF = 1, kB = 1;
+        bool haveF = false, haveB = false;
+        for (int k = 1; k <= 4; ++k) {
+            NbInfo tmp;
+            haveF = NeighbourFlow(in_data, +step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
+            if (err) return err;
+            if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
+            infoF = tmp; kF = k;
+            if (!haveF || tmp.diff >= kDup) break;
+        }
+        for (int k = 1; k <= 4; ++k) {
+            NbInfo tmp;
+            haveB = NeighbourFlow(in_data, -step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
+            if (err) return err;
+            if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
+            infoB = tmp; kB = k;
+            if (!haveB || tmp.diff >= kDup) break;
+        }
+        if (haveF && infoF.diff < kDup) kF = 1; // nirgends Bewegung: Abstand egal
+        if (haveB && infoB.diff < kDup) kB = 1;
+        // Wiederholt das Material jedes Bild r-mal (z. B. 30 fps in 60-fps-Sequenz:
+        // AABBCC), enthaelt auch der direkt benachbarte andere Frame die Bewegung
+        // von r Bildern. Daher beide Richtungen durch denselben Faktor teilen.
+        const int rep = std::max(kF, kB);
 
         // Plausibilitaet der Nachbarbilder: Bei Zeitverzerrung (Speed Ramp,
         // Zeit-Neuzuordnung) liefert Premiere Nachbarbilder aus der unverzerrten
@@ -703,6 +726,14 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             haveF = haveB = false;
         }
 
+        // Bewegung auf einen Bildabstand umrechnen (doppelte Bilder)
+        auto scaleFlow = [](fmb::Flow& f, int k) {
+            if (k <= 1) return;
+            const float inv = 1.f / k;
+            for (float& v : f.u.d) v *= inv;
+            for (float& v : f.v.d) v *= inv;
+        };
+
         std::string modelState = "AUS (FREI)";
         fmb::CameraInfo camInfo;
         if (cameraMode && (haveF || haveB)) {
@@ -715,6 +746,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                              },
                              haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci);
             camInfo = ci;
+            if (haveF) scaleFlow(fwd, rep);
+            if (haveB) scaleFlow(bwd, rep);
             const bool okAll = (!haveF || ci.modelF) && (!haveB || ci.modelB);
             modelState = std::string(okAll ? "OK" : "TEILWEISE") + "  MODELL " + Num(ci.sel.model * 100, 0) +
                          "% TRACKING " + Num(ci.sel.local * 100, 0) + "% RUHE " + Num(ci.sel.zero * 100, 0) + "%";
@@ -722,6 +755,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             if (haveF && !gF.empty()) fmb::ApplyGuides(fwd, gF, fp.guideRadius, 1.f);
             if (haveB && !gB.empty()) fmb::ApplyGuides(bwd, gB, fp.guideRadius, 1.f);
         } else if (!cameraMode) {
+            if (haveF) scaleFlow(fwd, rep);
+            if (haveB) scaleFlow(bwd, rep);
             fmb::RefineFlows(curLuma, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr);
         }
         // mittlere Bewegung fuer die Diagnose
@@ -758,9 +793,9 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")");
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
             L.push_back("KAMERA: " + modelState);
-            L.push_back("VORWAERTS: " + infoF.status);
+            L.push_back("VORWAERTS: " + infoF.status + (kF > 1 ? "  (" + std::to_string(kF) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoF.diff * 100, 2) + "  VORSUCHE " + Num(infoF.shift) + "  BEWEGUNG " + Num(infoF.motion) + " PX");
-            L.push_back("RUECKWAERTS: " + infoB.status);
+            L.push_back("RUECKWAERTS: " + infoB.status + (kB > 1 ? "  (" + std::to_string(kB) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  VORSUCHE " + Num(infoB.shift) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
             L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
             L.push_back("NACHBARN UNTEREINANDER: " + Num(diffNP * 100, 2) + (neighboursWrong ? "  -> ZEITVERZERRUNG, CLIP VERSCHACHTELN" : ""));
