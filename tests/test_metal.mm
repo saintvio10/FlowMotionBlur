@@ -128,7 +128,9 @@ int main()
                     double md = 0;
                     if (lg.w != lc.w || lg.h != lc.h) md = 1;
                     else for (size_t i = 0; i < lc.d.size(); ++i) md = std::max(md, (double)std::fabs(lg.d[i] - lc.d[i]));
-                    double ac = 0; for (size_t i = 0; i < (size_t)W * H; ++i) ac += pm.d[i * 4 + 3]; ac /= (double)W * H;
+                    // Referenz: Mittel der Zell-Mittelwerte (wie der Kern), Alpha = Luminanz mit Gewicht 1
+                    Image ca; LumaFromRGBA(pm, factor, ca, 1.f);
+                    double ac = 0; for (float v : ca.d) ac += v; ac /= ca.d.size();
                     const bool ok = md < tol && std::fabs(am - ac) < tol;
                     std::printf("LUMA %s faktor %d alpha %.1f: max. Abweichung %.2e, Alpha %.4f/%.4f %s\n",
                                 half ? "16F" : "32F", factor, aw, md, am, ac, ok ? "OK" : "FEHLER");

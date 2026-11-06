@@ -1,21 +1,18 @@
-Flow Motion Blur 1.1 - Plugin fuer Adobe Premiere Pro (macOS, Intel + Apple-Chip)
+Flow Motion Blur 2.1 - Plugin fuer Adobe Premiere Pro (macOS, Intel + Apple-Chip)
 ================================================================================
 
-INSTALLIEREN
+INSTALLIEREN (ohne Admin-Rechte)
 1. Premiere Pro beenden.
-2. Im Finder: Menue "Gehe zu" -> "Gehe zum Ordner ..." und eingeben:
+2. Programm "Terminal" oeffnen und diese Zeile einfuegen (ZIP liegt in "Downloads"):
 
-     /Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/
+     cd ~/Downloads && rm -rf FlowMotionBlur_Mac && ditto -x -k FlowMotionBlur_Mac.zip . && mkdir -p ~/"Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore" && rm -rf ~/"Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/FlowMotionBlur.plugin" && cp -R FlowMotionBlur_Mac/FlowMotionBlur.plugin ~/"Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/" && xattr -cr ~/"Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/FlowMotionBlur.plugin" && echo FERTIG
 
-3. "FlowMotionBlur.plugin" in diesen Ordner ziehen (Mac-Passwort eingeben).
-4. Weil das Plugin nicht von Apple beglaubigt ist, die Sperre entfernen:
-   Programm "Terminal" oeffnen, diese Zeile einfuegen, Enter, Passwort eingeben:
-
-     sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/FlowMotionBlur.plugin"
-
-5. Premiere Pro starten -> Effekte -> "Flow Motion Blur".
+3. Premiere Pro starten -> Effekte -> "Flow Motion Blur".
 
 BENUTZEN
-- Effekt auf einen Clip ziehen, Staerke ueber "Blur Amount (Shutter)" (0.5 = Film-Look).
+- Effekt auf einen Clip oder eine Einstellungsebene ziehen, Staerke ueber
+  "Blur Amount (Shutter)" (0.5 = Film-Look).
 - Fuer schnelle Vorschau: "Analyse-Qualitaet" auf "Schnell".
 - "Ansicht: Bewegungsvektoren" zeigt, was als Bewegung erkannt wird.
+- "Premiere-GPU (Metal)": Bilder bleiben auf der Grafikkarte (schneller). Die Ansicht
+  "Diagnose" zeigt in der Zeile "PREMIERE-GPU", ob dieser Weg aktiv war.
