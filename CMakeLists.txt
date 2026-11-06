@@ -20,6 +20,13 @@ if(MSVC)
 else()
   target_compile_options(fmb_core PRIVATE -O3)
 endif()
+# Intel-Macs: AVX2/FMA nutzen. Aktuelle Premiere-Versionen setzen auf Intel-Macs
+# ohnehin mindestens einen Prozessor ab der 6. Generation (Skylake) voraus,
+# der diese Befehle beherrscht. Der arm64-Teil (Apple-Chips) bleibt unberuehrt.
+if(APPLE)
+  set(FMB_X86_OPT "SHELL:-Xarch_x86_64 -mavx2" "SHELL:-Xarch_x86_64 -mfma")
+  target_compile_options(fmb_core PRIVATE ${FMB_X86_OPT})
+endif()
 
 # --- Test (laeuft ueberall, auch ohne SDK) ---------------------------------
 add_executable(fmb_test tests/test_core.cpp)
@@ -83,5 +90,5 @@ elseif(APPLE)
     BUNDLE TRUE
     BUNDLE_EXTENSION "plugin"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/Info.plist.in")
-  target_compile_options(FlowMotionBlur PRIVATE -Wno-multichar)
+  target_compile_options(FlowMotionBlur PRIVATE -Wno-multichar -O3 ${FMB_X86_OPT})
 endif()

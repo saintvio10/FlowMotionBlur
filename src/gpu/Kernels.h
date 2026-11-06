@@ -171,7 +171,7 @@ R"CLC(
 // mode: 0 = vor+rueck, 1 = nur vorwaerts, 2 = nur rueckwaerts
 __kernel void velocity(__global const float* fu, __global const float* fv,
                        __global const float* bu, __global const float* bv,
-                       int fw, int fh, int mode, float scale, float halfShutter, float maxRadius,
+                       int fw, int fh, int mode, float scale, float halfShutter, float maxRadius, float minMotion,
                        __global float* VX, __global float* VY, int W, int H)
 {
     int x = get_global_id(0), y = get_global_id(1);
@@ -187,7 +187,13 @@ __kernel void velocity(__global const float* fu, __global const float* fv,
     } else {
         vx = -smp(bu, fw, fh, fx, fy); vy = -smp(bv, fw, fh, fx, fy);
     }
-    vx *= scale * halfShutter; vy *= scale * halfShutter;
+    vx *= scale; vy *= scale;
+    if (minMotion > 0.0f) {
+        float l = sqrt(vx * vx + vy * vy);
+        float k = l > minMotion ? (l - minMotion) / l : 0.0f;
+        vx *= k; vy *= k;
+    }
+    vx *= halfShutter; vy *= halfShutter;
     float len = sqrt(vx * vx + vy * vy);
     if (len > maxRadius) { vx *= maxRadius / len; vy *= maxRadius / len; }
     VX[y * W + x] = vx; VY[y * W + x] = vy;

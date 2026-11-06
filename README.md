@@ -1,6 +1,6 @@
 # Flow Motion Blur – Plugin für Premiere Pro (und After Effects)
 
-**Version 1.8**
+**Version 1.9**
 
 Automatische, vektorbasierte Bewegungsunschärfe: Das Plugin verfolgt jeden Pixel
 vom vorherigen zum nächsten Frame (optischer Fluss) und verwischt das Bild entlang
@@ -25,6 +25,7 @@ dieser Bewegung. Einfach auf einen Clip ziehen – fertig.
 | Parameter | Bedeutung |
 |---|---|
 | **Blur Amount (Shutter)** | Stärke. 0.5 = Film-Look (180°), 1.0 = doppelt so lang |
+| **Mindestbewegung (px)** | Bewegung bis zu diesem Wert (Pixel pro Bild) bleibt scharf, darüber steigt die Unschärfe weich an. Z. B. 10–15, damit nur der schnelle Vordergrund verwischt. |
 | **Bewegungsart** | **Kamera (Drohne, Schwenk, Fahrt)**: Die Kamerabewegung wird direkt aus den Bildern als ein perspektivisches Modell bestimmt (auch bei Speed Ramps mit sehr großer Bewegung). Je Bildstelle wird gewählt, ob Modell, feines Tracking oder Ruhe (z. B. Himmel) am besten passt. **Frei (bewegte Objekte)**: für bewegte Dinge bei ruhiger Kamera. |
 | **Unschärfe-Modus** | **Natürlich (Kamera)**: jeder Pixel entlang seiner eigenen Bewegung, wie eine echte Belichtung. **Objekte**: schnelle Objekte verschmieren über den Hintergrund. |
 | **Max Samples** | Qualität der Verwischung. Höher = glatter, langsamer |
@@ -137,6 +138,14 @@ src/plugin/FlowMotionBlur.*      Anbindung an Premiere/After Effects
 src/plugin/FlowMotionBlurPiPL.r  Plugin-Beschreibung für den Host
 tests/                           Tests (Kern, GPU-Vergleich, OpenCL-Deklarationen)
 ```
+
+## Auf einer Einstellungsebene verwenden
+
+Der Effekt kann auf einer Einstellungsebene über den Clips liegen. Beim ersten Bild prüft das
+Plugin, ob Premiere die Zeit beim Abruf der Nachbarbilder versetzt (bekanntes Verhalten bei
+Einstellungsebenen, die nicht am Anfang der Zeitleiste beginnen), und gleicht den Versatz aus.
+In der Ansicht „Diagnose“ zeigt die Zeile „ZEITVERSATZ“ das Ergebnis, „ABRUF JETZT = EINGABE“
+sollte nahe 0 liegen.
 
 ## Bekannte Einschränkungen
 

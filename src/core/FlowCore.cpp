@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <cmath>
 #include <thread>
 
@@ -17,31 +20,127 @@ namespace fmb {
 // Hilfsfunktionen
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Dauerhafter Thread-Pool
+// ---------------------------------------------------------------------------
+// Frueher wurden fuer jeden Rechenschritt neue Threads gestartet - bei vielen
+// kleinen Schritten pro Bild teuer. Jetzt laufen die Arbeiter dauerhaft und
+// holen sich Auftraege aus einer Warteschlange. Der Aufrufer arbeitet am eigenen
+// Auftrag mit, daher gibt es auch bei gleichzeitigen Aufrufen aus mehreren
+// Render-Threads keine Blockade.
+
+namespace {
+
+struct Job {
+    const std::function<void(int, int)>* fn;
+    std::atomic<int> next;
+    int end, grain;
+    std::atomic<int> active{0};   // Arbeiter, die gerade an diesem Auftrag rechnen
+    std::mutex m;
+    std::condition_variable cv;
+
+    // Bearbeitet Teilbereiche, bis keine mehr uebrig sind.
+    void Work()
+    {
+        for (;;) {
+            int b = next.fetch_add(grain);
+            if (b >= end) break;
+            (*fn)(b, std::min(end, b + grain));
+        }
+    }
+};
+
+class Pool {
+public:
+    Pool()
+    {
+        unsigned hw = std::thread::hardware_concurrency();
+        const int n = std::max(1, static_cast<int>(hw == 0 ? 4 : hw) - 1);
+        for (int i = 0; i < n; ++i) workers_.emplace_back([this] { Loop(); });
+    }
+    ~Pool()
+    {
+        { std::lock_guard<std::mutex> l(m_); stop_ = true; }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    int Size() const { return static_cast<int>(workers_.size()) + 1; }
+
+    void Run(Job& job)
+    {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            queue_.push_back(&job);
+        }
+        cv_.notify_all();
+        job.Work(); // selbst mitarbeiten
+        {
+            // Auftrag aus der Warteschlange nehmen (falls noch nicht geschehen)
+            std::lock_guard<std::mutex> l(m_);
+            for (auto it = queue_.begin(); it != queue_.end(); ++it)
+                if (*it == &job) { queue_.erase(it); break; }
+        }
+        // warten, bis alle Arbeiter diesen Auftrag verlassen haben
+        std::unique_lock<std::mutex> jl(job.m);
+        job.cv.wait(jl, [&] { return job.active.load() == 0; });
+    }
+
+private:
+    void Loop()
+    {
+        for (;;) {
+            Job* job = nullptr;
+            {
+                std::unique_lock<std::mutex> l(m_);
+                cv_.wait(l, [&] { return stop_ || !queue_.empty(); });
+                if (stop_) return;
+                job = queue_.front();
+                if (job->next.load() >= job->end) { queue_.pop_front(); continue; }
+                job->active.fetch_add(1);
+            }
+            job->Work();
+            {
+                // Abmelden und benachrichtigen unter der Sperre des Auftrags: Der
+                // Auftraggeber kann erst danach weiterlaufen und den Auftrag
+                // freigeben. Danach wird 'job' nicht mehr angefasst.
+                std::lock_guard<std::mutex> jl(job->m);
+                job->active.fetch_sub(1);
+                job->cv.notify_all();
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::deque<Job*> queue_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
+
+Pool& GetPool()
+{
+    // Bewusst nie freigegeben: Beim Entladen des Plugins / Beenden des Programms
+    // duerfen keine Threads mehr gejoint werden (unter Windows blockiert das im
+    // Loader-Lock). Das Betriebssystem beendet die Threads ohnehin.
+    static Pool* pool = new Pool();
+    return *pool;
+}
+
+} // namespace
+
 void ParallelFor(int begin, int end, const std::function<void(int, int)>& fn)
 {
     const int range = end - begin;
     if (range <= 0) return;
-
-    unsigned hw = std::thread::hardware_concurrency();
-    int threads = static_cast<int>(hw == 0 ? 4 : hw);
-    threads = std::min(threads, range);
+    Pool& pool = GetPool();
+    const int threads = std::min(pool.Size(), range);
     if (threads <= 1 || range < 16) { fn(begin, end); return; }
-
-    const int grain = std::max(1, range / (threads * 4));
-    std::atomic<int> next(begin);
-    auto worker = [&]() {
-        for (;;) {
-            int b = next.fetch_add(grain);
-            if (b >= end) break;
-            fn(b, std::min(end, b + grain));
-        }
-    };
-
-    std::vector<std::thread> pool;
-    pool.reserve(threads - 1);
-    for (int i = 0; i < threads - 1; ++i) pool.emplace_back(worker);
-    worker();
-    for (auto& t : pool) t.join();
+    Job job;
+    job.fn = &fn;
+    job.next.store(begin);
+    job.end = end;
+    job.grain = std::max(1, range / (threads * 4));
+    pool.Run(job);
 }
 
 static inline float Clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -688,7 +787,14 @@ void ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
                 } else {
                     vx = -Sample(bwd->u, fx, fy); vy = -Sample(bwd->v, fx, fy);
                 }
-                vx *= scale * half; vy *= scale * half;
+                vx *= scale; vy *= scale; // Pixel pro Bild in voller Aufloesung
+                if (p.minMotion > 0.f) {
+                    // Mindestbewegung abziehen: darunter scharf, darueber weich ansteigend
+                    const float l = std::sqrt(vx * vx + vy * vy);
+                    const float k = l > p.minMotion ? (l - p.minMotion) / l : 0.f;
+                    vx *= k; vy *= k;
+                }
+                vx *= half; vy *= half;
                 float len = std::sqrt(vx * vx + vy * vy);
                 if (len > kMaxBlurRadius) { vx *= kMaxBlurRadius / len; vy *= kMaxBlurRadius / len; len = kMaxBlurRadius; }
                 VX.row(y)[x] = vx; VY.row(y)[x] = vy;
@@ -981,18 +1087,6 @@ static double OptimizeLevel(const Image& A, const Image& B, const Image& Bx, con
     return cost;
 }
 
-double HomographyCost(const Image& I0, const Image& I1, const double H[9])
-{
-    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return 1e9;
-    // auf ~480 px verkleinert bewerten (wie die feinste Stufe von AlignHomography)
-    Image A, B, sa, sb;
-    BoxFilter(I0, 1, A); BoxFilter(I1, 1, B);
-    while (std::max(A.w, A.h) > 480) { Downscale(A, 2, sa); Downscale(B, 2, sb); BoxFilter(sa, 1, A); BoxFilter(sb, 1, B); }
-    Image Bx, By; Bx.resize(B.w, B.h); By.resize(B.w, B.h);
-    double h[8]; for (int k = 0; k < 8; ++k) h[k] = H[k] / H[8];
-    return OptimizeLevel(A, B, Bx, By, h, 0);
-}
-
 bool InvertHomography(const double H[9], double Hi[9])
 {
     const double a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7], i = H[8];
@@ -1005,37 +1099,73 @@ bool InvertHomography(const double H[9], double Hi[9])
     return true;
 }
 
-bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initDy,
-                     double H[9], double* residual, const double* extraInit)
-{
-    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return false;
-    // Pyramide bis ~48 px
-    std::vector<Image> P0(1), P1(1);
-    BoxFilter(I0, 1, P0[0]); BoxFilter(I1, 1, P1[0]);
-    while (std::max(P0.back().w, P0.back().h) > 64 && std::min(P0.back().w, P0.back().h) / 2 >= 24) {
-        Image a, b, sa, sb;
-        Downscale(P0.back(), 2, a); Downscale(P1.back(), 2, b);
-        BoxFilter(a, 1, sa); BoxFilter(b, 1, sb);
-        P0.push_back(std::move(sa)); P1.push_back(std::move(sb));
-    }
-    int finest = 0;
-    while (finest + 1 < static_cast<int>(P0.size()) && std::max(P0[finest].w, P0[finest].h) > 480) ++finest;
-    const int coarsest = static_cast<int>(P0.size()) - 1;
+// Bildpyramide fuer die Kamerabewegung (geglaettet, bis ~64 px) samt Gradienten.
+// Wird pro Bild einmal gebaut und fuer alle Schaetzungen wiederverwendet.
+struct AlignPyr {
+    std::vector<Image> P, Gx, Gy;
+    int finest = 0;   // feinste verwendete Stufe (max. ~480 px)
+    int w0 = 0, h0 = 0;
+};
 
-    auto grads = [](const Image& B, Image& Bx, Image& By) {
+static void BuildAlignPyr(const Image& I, AlignPyr& out)
+{
+    out.P.assign(1, Image());
+    BoxFilter(I, 1, out.P[0]);
+    while (std::max(out.P.back().w, out.P.back().h) > 64 && std::min(out.P.back().w, out.P.back().h) / 2 >= 24) {
+        Image a, sa;
+        Downscale(out.P.back(), 2, a);
+        BoxFilter(a, 1, sa);
+        out.P.push_back(std::move(sa));
+    }
+    out.finest = 0;
+    while (out.finest + 1 < static_cast<int>(out.P.size()) && std::max(out.P[out.finest].w, out.P[out.finest].h) > 480) ++out.finest;
+    out.w0 = I.w; out.h0 = I.h;
+    // Gradienten nur fuer die verwendeten Stufen
+    out.Gx.assign(out.P.size(), Image());
+    out.Gy.assign(out.P.size(), Image());
+    for (int L = out.finest; L < static_cast<int>(out.P.size()); ++L) {
+        const Image& B = out.P[L];
         const int w = B.w, hh = B.h;
-        Bx.resize(w, hh); By.resize(w, hh);
+        out.Gx[L].resize(w, hh); out.Gy[L].resize(w, hh);
         for (int y = 0; y < hh; ++y)
             for (int x = 0; x < w; ++x) {
-                Bx.row(y)[x] = 0.5f * (B.row(y)[std::min(x + 1, w - 1)] - B.row(y)[std::max(x - 1, 0)]);
-                By.row(y)[x] = 0.5f * (B.row(std::min(y + 1, hh - 1))[x] - B.row(std::max(y - 1, 0))[x]);
+                out.Gx[L].row(y)[x] = 0.5f * (B.row(y)[std::min(x + 1, w - 1)] - B.row(y)[std::max(x - 1, 0)]);
+                out.Gy[L].row(y)[x] = 0.5f * (B.row(std::min(y + 1, hh - 1))[x] - B.row(std::max(y - 1, 0))[x]);
             }
-    };
+    }
+}
+
+// Restfehler einer Homographie auf der feinsten verwendeten Stufe.
+static double CostPyr(const AlignPyr& A, const AlignPyr& B, const double H[9])
+{
+    if (std::fabs(H[8]) < 1e-12) return 1e9;
+    double h[8]; for (int k = 0; k < 8; ++k) h[k] = H[k] / H[8];
+    const int L = A.finest;
+    return OptimizeLevel(A.P[L], B.P[L], B.Gx[L], B.Gy[L], h, 0);
+}
+
+// Verfeinert h nur auf den beiden feinsten Stufen (fuer gute Startwerte).
+static double RefineFine(const AlignPyr& A, const AlignPyr& B, double h[8])
+{
+    const int coarsest = static_cast<int>(A.P.size()) - 1;
+    double c = 1e9;
+    for (int L = std::min(coarsest, A.finest + 1); L >= A.finest; --L)
+        c = OptimizeLevel(A.P[L], B.P[L], B.Gx[L], B.Gy[L], h, 20);
+    return c;
+}
+
+static bool AlignPyrH(const AlignPyr& A, const AlignPyr& B, float initDx, float initDy,
+                      double H[9], double* residual, const double* extraInit)
+{
+    const std::vector<Image>& P0 = A.P;
+    const std::vector<Image>& P1 = B.P;
+    const int finest = A.finest;
+    const int coarsest = static_cast<int>(P0.size()) - 1;
 
     // Startlagen: Verschiebung aus der Vorsuche, kombiniert mit Vorwaerts-/
     // Rueckwaertsflug (Zoom) um verschiedene Fluchtpunkte. Grosse Bewegungen
     // (Speed Ramps) liegen sonst ausserhalb des Einzugsbereichs.
-    const double s00 = 0.5 * std::max(I0.w, I0.h);
+    const double s00 = 0.5 * std::max(A.w0, A.h0);
     const double tx = initDx / s00, ty = initDy / s00;
     struct Hyp { double h[8]; double cost; };
     std::vector<Hyp> hyps;
@@ -1048,36 +1178,29 @@ bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initD
             Hyp hp = { { sc, 0, tx, 0, sc, ty + cyn * (1 - sc), 0, 0 }, 0 };
             hyps.push_back(hp);
         }
-
-    {
-        Image Bx, By; grads(P1[coarsest], Bx, By);
-        for (Hyp& hp : hyps) hp.cost = OptimizeLevel(P0[coarsest], P1[coarsest], Bx, By, hp.h, 30);
-    }
-    std::sort(hyps.begin(), hyps.end(), [](const Hyp& a, const Hyp& b) { return a.cost < b.cost; });
+    // Die Startlagen sind unabhaengig voneinander -> parallel optimieren
+    ParallelFor(0, static_cast<int>(hyps.size()), [&](int i0, int i1) {
+        for (int i = i0; i < i1; ++i)
+            hyps[i].cost = OptimizeLevel(P0[coarsest], P1[coarsest], B.Gx[coarsest], B.Gy[coarsest], hyps[i].h, 30);
+    });
+    std::sort(hyps.begin(), hyps.end(), [](const Hyp& x, const Hyp& y) { return x.cost < y.cost; });
     // die besten drei auf der naechsten Stufe gegeneinander pruefen
     if (hyps.size() > 3) hyps.resize(3);
     int level = coarsest;
     if (coarsest - 1 >= finest) {
         level = coarsest - 1;
-        Image Bx, By; grads(P1[level], Bx, By);
-        for (Hyp& hp : hyps) hp.cost = OptimizeLevel(P0[level], P1[level], Bx, By, hp.h, 20);
-        std::sort(hyps.begin(), hyps.end(), [](const Hyp& a, const Hyp& b) { return a.cost < b.cost; });
+        for (Hyp& hp : hyps) hp.cost = OptimizeLevel(P0[level], P1[level], B.Gx[level], B.Gy[level], hp.h, 20);
+        std::sort(hyps.begin(), hyps.end(), [](const Hyp& x, const Hyp& y) { return x.cost < y.cost; });
     }
     double h[8]; std::copy(hyps[0].h, hyps[0].h + 8, h);
     double lastCost = hyps[0].cost;
-    for (int L = level - 1; L >= finest; --L) {
-        Image Bx, By; grads(P1[L], Bx, By);
-        lastCost = OptimizeLevel(P0[L], P1[L], Bx, By, h, 20);
-    }
+    for (int L = level - 1; L >= finest; --L)
+        lastCost = OptimizeLevel(P0[L], P1[L], B.Gx[L], B.Gy[L], h, 20);
     // Zusaetzliche Startlage (z. B. Umkehrung der Gegenrichtung): nur auf den
     // feinen Stufen verfeinern - grobe Stufen koennten sie verwerfen.
     if (extraInit && std::fabs(extraInit[8]) > 1e-12) {
         double he[8]; for (int k = 0; k < 8; ++k) he[k] = extraInit[k] / extraInit[8];
-        double ce = 1e9;
-        for (int L = std::min(coarsest, finest + 1); L >= finest; --L) {
-            Image Bx, By; grads(P1[L], Bx, By);
-            ce = OptimizeLevel(P0[L], P1[L], Bx, By, he, 20);
-        }
+        const double ce = RefineFine(A, B, he);
         if (ce < lastCost) { std::copy(he, he + 8, h); lastCost = ce; }
     }
     if (lastCost >= 1e8) return false;
@@ -1085,6 +1208,23 @@ bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initD
     H[8] = 1.0;
     if (residual) *residual = lastCost;
     return true;
+}
+
+bool AlignHomography(const Image& I0, const Image& I1, float initDx, float initDy,
+                     double H[9], double* residual, const double* extraInit)
+{
+    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return false;
+    AlignPyr A, B;
+    BuildAlignPyr(I0, A); BuildAlignPyr(I1, B);
+    return AlignPyrH(A, B, initDx, initDy, H, residual, extraInit);
+}
+
+double HomographyCost(const Image& I0, const Image& I1, const double H[9])
+{
+    if (I0.empty() || I0.w != I1.w || I0.h != I1.h) return 1e9;
+    AlignPyr A, B;
+    BuildAlignPyr(I0, A); BuildAlignPyr(I1, B);
+    return CostPyr(A, B, H);
 }
 
 void HomographyField(const double H[9], int w, int h, Flow& out)
@@ -1196,36 +1336,55 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
     Flow mf, mb;
     double Hf[9], Hb[9];
     float fdx = 0, fdy = 0, bdx = 0, bdy = 0;
-    if (In && fwd) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignHomography(I0, *In, fdx, fdy, Hf, &ci.resF); ci.whyF = ci.modelF ? "OK" : "SCHAETZUNG GESCHEITERT"; }
-    if (Ip && bwd) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignHomography(I0, *Ip, bdx, bdy, Hb, &ci.resB); ci.whyB = ci.modelB ? "OK" : "SCHAETZUNG GESCHEITERT"; }
+    const bool useF = In && fwd && In->w == I0.w && In->h == I0.h;
+    const bool useB = Ip && bwd && Ip->w == I0.w && Ip->h == I0.h;
+    // Pyramiden je Bild nur einmal bauen
+    AlignPyr P0, PN, PP;
+    BuildAlignPyr(I0, P0);
+    if (useF) BuildAlignPyr(*In, PN);
+    if (useB) BuildAlignPyr(*Ip, PP);
+    if (useF) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignPyrH(P0, PN, fdx, fdy, Hf, &ci.resF, nullptr); ci.whyF = ci.modelF ? "OK" : "SCHAETZUNG GESCHEITERT"; }
+    if (useB) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignPyrH(P0, PP, bdx, bdy, Hb, &ci.resB, nullptr); ci.whyB = ci.modelB ? "OK" : "SCHAETZUNG GESCHEITERT"; }
     ci.shiftFx = fdx; ci.shiftFy = fdy; ci.shiftBx = bdx; ci.shiftBy = bdy;
     const double Hid[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-    const double zeroF = (In && fwd) ? HomographyCost(I0, *In, Hid) : 0;
-    const double zeroB = (Ip && bwd) ? HomographyCost(I0, *Ip, Hid) : 0;
-    // Gegenrichtung als zusaetzliche Startlage: rueckwaerts ~ Umkehrung von vorwaerts.
-    // Hilft besonders bei grossen Bewegungen, wo eine Richtung viel Inhalt verliert.
-    if (ci.modelF && Ip && bwd) {
-        double inv[9], H2[9], r2;
-        if (InvertHomography(Hf, inv) && AlignHomography(I0, *Ip, bdx, bdy, H2, &r2, inv) && (!ci.modelB || r2 < ci.resB)) {
-            std::copy(H2, H2 + 9, Hb); ci.resB = r2; ci.modelB = true;
+    const double zeroF = useF ? CostPyr(P0, PN, Hid) : 0;
+    const double zeroB = useB ? CostPyr(P0, PP, Hid) : 0;
+    // Gegenrichtung als Pruefung: rueckwaerts ~ Umkehrung von vorwaerts. Nur
+    // verfeinern, wenn die Umkehrung besser passt als die eigene Schaetzung
+    // (hilft bei grossen Bewegungen, wo eine Richtung viel Inhalt verliert).
+    auto tryInverse = [&](bool haveOther, const double* Hother, bool useThis, const AlignPyr& PT,
+                          bool& model, double* Hthis, double& res) {
+        if (!haveOther || !useThis) return;
+        double inv[9];
+        if (!InvertHomography(Hother, inv)) return;
+        const double cInv = CostPyr(P0, PT, inv);
+        const double cOwn = model ? CostPyr(P0, PT, Hthis) : 1e9;
+        if (cInv >= cOwn) return;
+        double he[8]; for (int k = 0; k < 8; ++k) he[k] = inv[k] / inv[8];
+        const double c = RefineFine(P0, PT, he);
+        if (c < 1e8 && (!model || c < res)) {
+            for (int k = 0; k < 8; ++k) Hthis[k] = he[k];
+            Hthis[8] = 1.0; res = c; model = true;
         }
-    }
-    if (ci.modelB && In && fwd) {
-        double inv[9], H2[9], r2;
-        if (InvertHomography(Hb, inv) && AlignHomography(I0, *In, fdx, fdy, H2, &r2, inv) && (!ci.modelF || r2 < ci.resF)) {
-            std::copy(H2, H2 + 9, Hf); ci.resF = r2; ci.modelF = true;
-        }
-    }
+    };
+    tryInverse(ci.modelF, Hf, useB, PP, ci.modelB, Hb, ci.resB);
+    tryInverse(ci.modelB, Hb, useF, PN, ci.modelF, Hf, ci.resF);
     // Modell nur verwenden, wenn es besser zu den Bildern passt als "keine Bewegung"
     ci.zeroF = zeroF; ci.zeroB = zeroB;
-    if (ci.modelF) { ci.costF = HomographyCost(I0, *In, Hf); ci.whyF = "OK"; std::copy(Hf, Hf + 9, ci.Hf);
+    if (ci.modelF) { ci.costF = CostPyr(P0, PN, Hf); ci.whyF = "OK"; std::copy(Hf, Hf + 9, ci.Hf);
                      if (ci.costF >= zeroF) { ci.modelF = false; ci.whyF = "SCHLECHTER ALS RUHE"; } }
-    if (ci.modelB) { ci.costB = HomographyCost(I0, *Ip, Hb); ci.whyB = "OK"; std::copy(Hb, Hb + 9, ci.Hb);
+    if (ci.modelB) { ci.costB = CostPyr(P0, PP, Hb); ci.whyB = "OK"; std::copy(Hb, Hb + 9, ci.Hb);
                      if (ci.costB >= zeroB) { ci.modelB = false; ci.whyB = "SCHLECHTER ALS RUHE"; } }
     auto track = [&](const Image* In1, Flow* out, Flow& model, bool ok, const double* Hm, float dx, float dy) {
         if (!In1 || !out) return;
         FlowParams q = p;
-        if (ok) { HomographyField(Hm, I0.w, I0.h, model); q.initFlow = &model; }
+        if (ok) {
+            HomographyField(Hm, I0.w, I0.h, model); q.initFlow = &model;
+            // Startet am Kameramodell: nur noch kleine Abweichungen (Parallaxe)
+            // -> wenige Pyramidenstufen genuegen, spart viel Rechenzeit.
+            q.maxLevels = std::min(q.maxLevels, 3);
+            q.iterations = std::min(q.iterations, 3);
+        }
         else    { q.initU = dx; q.initV = dy; }
         flowFn(I0, *In1, q, *out);
     };

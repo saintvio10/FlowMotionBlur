@@ -31,6 +31,9 @@
 #include <new>
 #include <string>
 #include <cstdlib>
+#include <chrono>
+#include <map>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 
@@ -222,11 +225,87 @@ static void WriteWorld(const fmb::RGBAImage& img, PixKind kind, PF_EffectWorld* 
     });
 }
 
-static double AlphaSum(const fmb::RGBAImage& img)
+// Liest ein Pixel als vormultipliziertes RGBA (0..1).
+static inline void ReadPixel(const char* row, int x, PixKind kind, bool straight, float o[4])
+{
+    switch (kind) {
+    case PixKind::AE_ARGB8: { const PF_Pixel* p = reinterpret_cast<const PF_Pixel*>(row) + x;
+        o[0] = p->red / 255.f; o[1] = p->green / 255.f; o[2] = p->blue / 255.f; o[3] = p->alpha / 255.f; break; }
+    case PixKind::AE_ARGB16: { const PF_Pixel16* p = reinterpret_cast<const PF_Pixel16*>(row) + x; const float k = 1.f / PF_MAX_CHAN16;
+        o[0] = p->red * k; o[1] = p->green * k; o[2] = p->blue * k; o[3] = p->alpha * k; break; }
+    case PixKind::AE_ARGB32F: { const PF_PixelFloat* p = reinterpret_cast<const PF_PixelFloat*>(row) + x;
+        o[0] = p->red; o[1] = p->green; o[2] = p->blue; o[3] = p->alpha; break; }
+    case PixKind::PR_BGRA8: { const unsigned char* p = reinterpret_cast<const unsigned char*>(row) + x * 4;
+        o[0] = p[2] / 255.f; o[1] = p[1] / 255.f; o[2] = p[0] / 255.f; o[3] = p[3] / 255.f; break; }
+    case PixKind::PR_BGRA32F: { const float* p = reinterpret_cast<const float*>(row) + x * 4;
+        o[0] = p[2]; o[1] = p[1]; o[2] = p[0]; o[3] = p[3]; break; }
+    default: o[0] = o[1] = o[2] = o[3] = 0.f;
+    }
+    if (straight) { o[0] *= o[3]; o[1] *= o[3]; o[2] *= o[3]; }
+}
+
+// Liest direkt die verkleinerte Luminanz (wie LumaFromRGBA) und den mittleren
+// Alphawert - ohne das Bild vorher in voller Aufloesung in Farbe abzulegen.
+static void ReadLumaWorld(const PF_EffectWorld* w, PixKind kind, bool straight, int factor,
+                          float alphaWeight, fmb::Image& out, double& alphaMean)
+{
+    factor = std::max(1, factor);
+    const int ow = (w->width + factor - 1) / factor, oh = (w->height + factor - 1) / factor;
+    out.resize(ow, oh);
+    std::vector<double> rowAlpha(oh, 0.0);
+    fmb::ParallelFor(0, oh, [&](int y0, int y1) {
+        float px[4];
+        for (int y = y0; y < y1; ++y) {
+            const int sy0 = y * factor, sy1 = std::min<int>(w->height, sy0 + factor);
+            double ra = 0;
+            for (int x = 0; x < ow; ++x) {
+                const int sx0 = x * factor, sx1 = std::min<int>(w->width, sx0 + factor);
+                float sum = 0; int n = 0;
+                for (int sy = sy0; sy < sy1; ++sy) {
+                    const char* row = static_cast<const char*>(static_cast<const void*>(w->data)) +
+                                      static_cast<ptrdiff_t>(sy) * w->rowbytes;
+                    for (int sx = sx0; sx < sx1; ++sx) {
+                        ReadPixel(row, sx, kind, straight, px);
+                        float l = 0.299f * px[0] + 0.587f * px[1] + 0.114f * px[2];
+                        sum += l * (1.f - alphaWeight) + px[3] * alphaWeight;
+                        ra += px[3];
+                        ++n;
+                    }
+                }
+                out.row(y)[x] = sum / n;
+            }
+            rowAlpha[y] = ra;
+        }
+    });
+    double a = 0; for (double r : rowAlpha) a += r;
+    alphaMean = a / std::max(1.0, static_cast<double>(w->width) * w->height);
+}
+
+// Bilineares Skalieren eines Graustufenbildes.
+static void ResizeLuma(const fmb::Image& src, int w, int h, fmb::Image& dst)
+{
+    dst.resize(w, h);
+    const float sx = static_cast<float>(src.w) / w, sy = static_cast<float>(src.h) / h;
+    fmb::ParallelFor(0, h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                float fx = std::min(std::max((x + 0.5f) * sx - 0.5f, 0.f), static_cast<float>(src.w - 1));
+                float fy = std::min(std::max((y + 0.5f) * sy - 0.5f, 0.f), static_cast<float>(src.h - 1));
+                int x0 = static_cast<int>(fx), y0i = static_cast<int>(fy);
+                int x1 = std::min(x0 + 1, src.w - 1), y1i = std::min(y0i + 1, src.h - 1);
+                float ax = fx - x0, ay = fy - y0i;
+                float a = src.row(y0i)[x0] * (1 - ax) + src.row(y0i)[x1] * ax;
+                float b = src.row(y1i)[x0] * (1 - ax) + src.row(y1i)[x1] * ax;
+                dst.row(y)[x] = a * (1 - ay) + b * ay;
+            }
+    });
+}
+
+static double AlphaMean(const fmb::RGBAImage& img)
 {
     double s = 0;
-    for (size_t i = 3; i < img.d.size(); i += 16) s += img.d[i]; // jedes 4. Pixel reicht
-    return s;
+    for (size_t i = 3; i < img.d.size(); i += 4) s += img.d[i];
+    return img.d.empty() ? 0.0 : s / (img.d.size() / 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +354,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Blur Amount (Shutter)", 0, 4, 0, 2, 0.5, PF_Precision_HUNDREDTHS,
                          0, 0, AMOUNT_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Mindestbewegung (px)", 0, 200, 0, 30, 0, PF_Precision_TENTHS,
+                         0, 0, MIN_MOTION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_SLIDER("Max Samples", 3, 256, 3, 64, 32, MAX_SAMPLES_DISK_ID);
@@ -510,27 +593,6 @@ static bool WritePGM(const std::filesystem::path& p, const fmb::Image& im)
     return static_cast<bool>(f);
 }
 
-// Bilineares Skalieren eines RGBA-Bildes (fuer Nachbarframes in anderer Groesse).
-static void ResizeRGBA(const fmb::RGBAImage& src, int w, int h, fmb::RGBAImage& dst)
-{
-    dst.resize(w, h);
-    const float sx = static_cast<float>(src.w) / w, sy = static_cast<float>(src.h) / h;
-    fmb::ParallelFor(0, h, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y)
-            for (int x = 0; x < w; ++x) {
-                float fx = std::min(std::max((x + 0.5f) * sx - 0.5f, 0.f), static_cast<float>(src.w - 1));
-                float fy = std::min(std::max((y + 0.5f) * sy - 0.5f, 0.f), static_cast<float>(src.h - 1));
-                int x0 = static_cast<int>(fx), y0i = static_cast<int>(fy);
-                int x1 = std::min(x0 + 1, src.w - 1), y1i = std::min(y0i + 1, src.h - 1);
-                float ax = fx - x0, ay = fy - y0i;
-                const float *a = src.px(x0, y0i), *b = src.px(x1, y0i), *c = src.px(x0, y1i), *d = src.px(x1, y1i);
-                float* o = dst.px(x, y);
-                for (int k = 0; k < 4; ++k)
-                    o[k] = (a[k] * (1 - ax) + b[k] * ax) * (1 - ay) + (c[k] * (1 - ax) + d[k] * ax) * ay;
-            }
-    });
-}
-
 // Holt den Frame bei current_time + offset und berechnet den Fluss dorthin.
 // Gibt false zurueck, wenn kein brauchbarer Nachbarframe existiert (Clip-Anfang/-Ende).
 // computeFlow = false: nur die Luminanz des Nachbarframes liefern (nbLuma),
@@ -561,21 +623,23 @@ static bool NeighbourFlow(PF_InData* in_data, A_long offset, const fmb::RGBAImag
         if (kind == PixKind::Unknown) {
             info.status = "FORMAT UNBEKANNT";
         } else {
-            fmb::RGBAImage nb;
-            ReadWorld(w, kind, nb, IsPremiere(in_data));
+            // Direkt als verkleinerte Luminanz einlesen (spart Speicher und Zeit)
+            double nbAlpha = 0;
             std::string sizeNote;
-            if (nb.w != cur.w || nb.h != cur.h) {
+            if (w->width != cur.w || w->height != cur.h) {
                 // Premiere liefert Nachbarframes evtl. in Clip- statt Sequenzgroesse
-                sizeNote = " SKALIERT VON " + std::to_string(nb.w) + "X" + std::to_string(nb.h);
-                fmb::RGBAImage tmp;
-                ResizeRGBA(nb, cur.w, cur.h, tmp);
-                nb = std::move(tmp);
+                sizeNote = " SKALIERT VON " + std::to_string(w->width) + "X" + std::to_string(w->height);
+                const int f2 = std::max(1, static_cast<int>(std::lround(factor * static_cast<double>(w->width) / cur.w)));
+                fmb::Image tmp;
+                ReadLumaWorld(w, kind, IsPremiere(in_data), f2, alphaWeight, tmp, nbAlpha);
+                ResizeLuma(tmp, curLuma.w, curLuma.h, nbLuma);
+            } else {
+                ReadLumaWorld(w, kind, IsPremiere(in_data), factor, alphaWeight, nbLuma, nbAlpha);
             }
             // Ausserhalb des Clips liefern Hosts oft ein leeres (transparentes) Bild.
-            if (curAlpha > 0.0 && AlphaSum(nb) <= 0.02 * curAlpha) {
+            if (curAlpha > 0.0 && nbAlpha <= 0.02 * curAlpha) {
                 info.status = "TRANSPARENT (AUSSERHALB DES CLIPS)" + sizeNote;
             } else {
-                fmb::LumaFromRGBA(nb, factor, nbLuma, alphaWeight);
                 double d = 0;
                 for (size_t i = 0; i < nbLuma.d.size(); ++i) d += std::fabs(nbLuma.d[i] - curLuma.d[i]);
                 info.diff = nbLuma.d.empty() ? 0 : d / nbLuma.d.size();
@@ -619,12 +683,24 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         return PF_COPY(input, output, NULL, NULL);
 
     try {
+        // Zeitmessung je Arbeitsschritt (fuer die Diagnose)
+        using Clock = std::chrono::steady_clock;
+        auto tMark = Clock::now();
+        std::string timing;
+        auto lap = [&](const char* name) {
+            auto now = Clock::now();
+            timing += std::string(name) + " " + std::to_string(static_cast<int>(
+                std::chrono::duration<double, std::milli>(now - tMark).count())) + "  ";
+            tMark = now;
+        };
         fmb::RGBAImage cur;
         ReadWorld(input, inKind, cur, IsPremiere(in_data));
 
         fmb::BlurParams bp;
         bp.shutter = amount;
         bp.maxSamples = samples;
+        // Mindestbewegung in Pixeln der vollen Aufloesung -> auf Vorschau umrechnen
+        bp.minMotion = static_cast<float>(params[FMB_MIN_MOTION]->u.fs_d.value / DownsampleX(in_data));
         bp.mode = (params[FMB_BLUR_MODE]->u.pd.value == MODE_OBJECTS) ? fmb::kBlurObjects : fmb::kBlurNatural;
         fmb::RGBAImage result;
 
@@ -654,7 +730,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 
         fmb::Image curLuma;
         fmb::LumaFromRGBA(cur, factor, curLuma, alphaWeight);
-        const double curAlpha = AlphaSum(cur);
+        const double curAlpha = AlphaMean(cur);
+        lap("LESEN");
 
         // Abstand zum Nachbarframe. Fehlt die Angabe, ca. 1/25 s verwenden
         // (frueher 1 Zeiteinheit -> praktisch derselbe Frame, keine Bewegung).
@@ -682,16 +759,72 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             step = std::max<A_long>(1, static_cast<A_long>(std::llround(baseStep * std::fabs(clipSpeed))));
         const int dirSign = clipSpeed < 0 ? -1 : 1; // rueckwaerts laufender Clip
 
-        // Selbsttest: Liefert ein Abruf zum aktuellen Zeitpunkt dasselbe Bild wie
-        // die Eingabe? Wenn nicht, rechnet Premiere in einer anderen Zeitbasis.
-        double selfDiff = -1.0;
-        {
-            fmb::Flow dummyFlow; fmb::Image selfLuma; NbInfo selfInfo; PF_Err e2 = PF_Err_NONE;
+        // Zeitversatz beim Bildabruf (z. B. Einstellungsebene, die nicht am Anfang
+        // der Zeitleiste liegt): Premiere rechnet die Abrufzeit dann teils in einer
+        // anderen Zeitbasis als current_time. Selbsttest: Liefert ein Abruf zum
+        // aktuellen Zeitpunkt dasselbe Bild wie die Eingabe? Falls nicht, werden
+        // Versaetze aus Clip-/Ebenenstart ausprobiert. Das Ergebnis wird je
+        // Effektinstanz und Position gemerkt, der Test laeuft also nur einmal.
+        auto selfTest = [&](A_long off, PF_Err& e2) -> double {
+            fmb::Flow dummyFlow; fmb::Image selfLuma; NbInfo selfInfo;
             const std::vector<fmb::Guide> none;
-            if (NeighbourFlow(in_data, 0, cur, curLuma, factor, fp, alphaWeight, curAlpha, none, eng,
+            if (NeighbourFlow(in_data, off, cur, curLuma, factor, fp, alphaWeight, curAlpha, none, eng,
                               dummyFlow, e2, selfInfo, false, selfLuma))
-                selfDiff = selfInfo.diff;
-            if (e2) return e2;
+                return selfInfo.diff;
+            return 1.0;
+        };
+        A_long timeOffset = 0;
+        double selfDiff = -1.0;
+        std::string offsetNote = "0";
+        if (IsPremiere(in_data)) {
+            A_long instanceId = 0, trackStart = 0, clipStart = 0;
+            {
+                Suite<PF_UtilitySuite> us(in_data, kPFUtilitySuite, kPFUtilitySuiteVersion2);
+                if (us) {
+                    if (us->GetFilterInstanceID) us->GetFilterInstanceID(in_data->effect_ref, &instanceId);
+                    if (us->GetTrackItemStart) us->GetTrackItemStart(in_data->effect_ref, &trackStart);
+                    if (us->GetClipStart) us->GetClipStart(in_data->effect_ref, &clipStart);
+                }
+            }
+            const std::string key = std::to_string(instanceId) + "/" + std::to_string(trackStart) + "/" +
+                                    std::to_string(clipStart) + "/" + std::to_string(in_data->time_scale);
+            static std::mutex cacheMutex;
+            static std::map<std::string, A_long> offsetCache;
+            bool cached = false;
+            if (instanceId != 0) {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                auto it = offsetCache.find(key);
+                if (it != offsetCache.end()) { timeOffset = it->second; cached = true; }
+            }
+            if (!cached || view == VIEW_DIAG) {
+                PF_Err e2 = PF_Err_NONE;
+                double best = selfTest(timeOffset, e2);
+                if (e2) return e2;
+                if (best > 0.01 && !cached) {
+                    // Kandidaten: Ebenen-/Clipstart in Bildern oder direkt in Zeiteinheiten
+                    std::vector<A_long> cands;
+                    for (A_long v : { trackStart, clipStart }) {
+                        if (v == 0) continue;
+                        for (long long c : { static_cast<long long>(v) * baseStep, static_cast<long long>(v) }) {
+                            cands.push_back(static_cast<A_long>(c));
+                            cands.push_back(static_cast<A_long>(-c));
+                        }
+                    }
+                    for (A_long c : cands) {
+                        const double d = selfTest(c, e2);
+                        if (e2) return e2;
+                        if (d < best) { best = d; timeOffset = c; }
+                    }
+                    if (best > 0.01) timeOffset = 0; // nichts passt: ohne Versatz
+                }
+                selfDiff = best;
+                if (instanceId != 0 && !cached) {
+                    std::lock_guard<std::mutex> lock(cacheMutex);
+                    offsetCache[key] = timeOffset;
+                }
+            }
+            offsetNote = std::to_string(timeOffset) + (cached ? " (GEMERKT)" : "") +
+                         "  EBENENSTART " + std::to_string(trackStart) + "  CLIPSTART " + std::to_string(clipStart);
         }
 
         const std::vector<fmb::Guide> gF = CollectGuides(in_data, params, +step, factor);
@@ -716,7 +849,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         bool haveF = false, haveB = false;
         for (int k = 1; k <= 4; ++k) {
             NbInfo tmp;
-            haveF = NeighbourFlow(in_data, dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
+            haveF = NeighbourFlow(in_data, timeOffset + dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoF = tmp; kF = k;
@@ -724,7 +857,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
         for (int k = 1; k <= 4; ++k) {
             NbInfo tmp;
-            haveB = NeighbourFlow(in_data, -dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
+            haveB = NeighbourFlow(in_data, timeOffset - dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoB = tmp; kB = k;
@@ -766,6 +899,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 
         std::string modelState = "AUS (FREI)";
         fmb::CameraInfo camInfo;
+        lap("NACHBARN");
         if (cameraMode && (haveF || haveB)) {
             // Kamerabewegung direkt aus den Bildern, feines Tracking ab diesem
             // Modell, Auswahl je Bildstelle (Modell / Tracking / keine Bewegung).
@@ -801,7 +935,9 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             const fmb::Flow& show = haveF ? fwd : bwd;
             fmb::VisualizeFlow(show, factor, cur.w, cur.h, result);
         } else {
+            lap("BEWEGUNG");
             eng.Blur(cur, haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, factor, bp, result);
+            lap("BLUR");
         }
         if (neighboursWrong && view != VIEW_DIAG) {
             std::vector<std::string> W;
@@ -821,6 +957,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("ZEIT: " + std::to_string(in_data->current_time) + "  SKALA: " + std::to_string(in_data->time_scale));
             L.push_back("TIME_STEP: " + std::to_string(in_data->time_step) + "  LOCAL: " + std::to_string(in_data->local_time_step));
             L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")  CLIP-TEMPO " + Num(clipSpeed * 100, 0) + "%");
+            L.push_back("ZEITVERSATZ: " + offsetNote);
             L.push_back("ABRUF JETZT = EINGABE? UNTERSCHIED " + (selfDiff < 0 ? std::string("-") : Num(selfDiff * 100, 2)) +
                         (selfDiff > 0.01 ? "  -> ZEITBASIS ABWEICHEND" : ""));
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
@@ -844,6 +981,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                 modelLines("MODELL VOR", haveF, camInfo.shiftFx, camInfo.shiftFy, camInfo.whyF, camInfo.costF, camInfo.zeroF, camInfo.Hf);
                 modelLines("MODELL RUECK", haveB, camInfo.shiftBx, camInfo.shiftBy, camInfo.whyB, camInfo.costB, camInfo.zeroB, camInfo.Hb);
             }
+            L.push_back("ZEIT MS: " + timing);
             // Bilder + Werte speichern (fuer die Fehlersuche)
             std::string exportState = "FEHLGESCHLAGEN";
             try {

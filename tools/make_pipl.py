@@ -41,6 +41,6 @@ def pipl(name, category, match, entry, spec_ver, spec_sub, version, outflags, ou
 if __name__ == '__main__':
     out = sys.argv[1]
     data = pipl('Flow Motion Blur', 'Flow Motion Blur', 'FMB FlowMotionBlur', 'EffectMain',
-                13, 29, 786433, 0x02000006, 0)
+                13, 29, 819201, 0x02000006, 0)
     open(out, 'wb').write(data)
     print(f'{out}: {len(data)} Bytes')

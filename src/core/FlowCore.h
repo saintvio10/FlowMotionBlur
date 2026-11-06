@@ -81,6 +81,8 @@ struct BlurParams {
     float shutter    = 0.5f; // 0.5 = 180 Grad Verschluss, 1.0 = 360 Grad
     int   maxSamples = 32;   // Obergrenze Samples pro Pixel
     int   mode       = kBlurNatural;
+    float minMotion  = 0.f;  // Bewegung (px pro Bild, volle Aufloesung) bis zu der nichts verwischt;
+                             // darueber steigt die Unschaerfe weich an
 };
 
 // Feste Konstanten des Rekonstruktionsfilters (CPU und GPU identisch).

@@ -8,12 +8,12 @@
 #define FMB_DESCRIPTION   "Vektorbasierte Bewegungsunschaerfe per optischem Fluss."
 
 #define FMB_MAJOR_VERSION 1
-#define FMB_MINOR_VERSION 8
+#define FMB_MINOR_VERSION 9
 #define FMB_BUG_VERSION   0
 #define FMB_STAGE_VERSION PF_Stage_DEVELOP
 #define FMB_BUILD_VERSION 1
 // Muss zu AE_Effect_Version in FlowMotionBlurPiPL.r passen:
-// PF_VERSION(1,8,0,PF_Stage_DEVELOP,1) = (1<<19)|(8<<15)|1 = 786433
+// PF_VERSION(1,9,0,PF_Stage_DEVELOP,1) = (1<<19)|(9<<15)|1 = 819201
 
 #define FMB_NUM_TRACK_POINTS 6
 
@@ -21,6 +21,7 @@
 enum {
     FMB_INPUT = 0,
     FMB_AMOUNT,          // Belichtungszeit (Shutter), 0.5 = 180 Grad
+    FMB_MIN_MOTION,      // Mindestbewegung: darunter keine Unschaerfe
     FMB_MAX_SAMPLES,     // max. Samples pro Pixel
     FMB_MOTION_TYPE,     // Kamera-Modell (Drohne, Schwenk) oder frei
     FMB_BLUR_MODE,       // Natuerlich (Kamera) oder Objekte
@@ -70,6 +71,7 @@ enum {
     TP_TOPIC_END_DISK_ID,
     BLUR_MODE_DISK_ID,
     MOTION_TYPE_DISK_ID,
+    MIN_MOTION_DISK_ID,
     TP_FIRST_DISK_ID = 100 // je Punkt i: 100 + 2i (aktiv), 101 + 2i (Position)
 };
 

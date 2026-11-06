@@ -430,7 +430,7 @@ bool ApplyMotionBlur(const RGBAImage& src, const Flow* fwd, const Flow* bwd,
     const size_t n = static_cast<size_t>(W) * H;
     Buf VX = S.Alloc(n), VY = S.Alloc(n);
     const float scale = static_cast<float>(std::max(1, flowScale));
-    S.Run("velocity", W, H, fu, fv, bu, bv, fw, fh, mode, scale, 0.5f * p.shutter, kMaxBlurRadius, VX, VY, W, H);
+    S.Run("velocity", W, H, fu, fv, bu, bv, fw, fh, mode, scale, 0.5f * p.shutter, kMaxBlurRadius, p.minMotion, VX, VY, W, H);
 
     Buf rm = S.Alloc(H);
     S.Run("row_max", H, 1, VX, VY, W, H, rm);

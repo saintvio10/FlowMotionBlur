@@ -197,6 +197,15 @@ int main(int argc, char** argv)
         std::printf("  Blur   GPU vs CPU: mittl. Abweichung %.6f, max %.4f (Farbwerte 0..1)  (%.0f ms)\n",
                     dm / cpuB.d.size(), mx, std::chrono::duration<double, std::milli>(t1 - t0).count());
 
+        // Mindestbewegung (Regler) auf CPU und GPU gleich
+        {
+            BlurParams bm; bm.minMotion = 3.f;
+            RGBAImage c2, g2;
+            ApplyMotionBlur(cur, &cf, &cb, scale, bm, c2);
+            if (!gpu::ApplyMotionBlur(cur, &cf, &cb, scale, bm, g2)) { std::printf("GPU-Blur (Mindestbewegung) FEHLGESCHLAGEN\n"); return 1; }
+            double m2 = 0; for (size_t i = 0; i < c2.d.size(); ++i) m2 = std::max(m2, (double)std::fabs(c2.d[i] - g2.d[i]));
+            std::printf("  Blur Mindestbewegung 3 px: max. Abweichung GPU/CPU %.4f\n", m2);
+        }
         // nur eine Richtung (Clip-Anfang/-Ende)
         ApplyMotionBlur(cur, &cf, nullptr, scale, bp, cpuB);
         gpu::ApplyMotionBlur(cur, &cf, nullptr, scale, bp, gpuB);
