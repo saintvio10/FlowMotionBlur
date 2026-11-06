@@ -1,6 +1,6 @@
 # Flow Motion Blur – Plugin für Premiere Pro (und After Effects)
 
-**Version 1.7**
+**Version 1.8**
 
 Automatische, vektorbasierte Bewegungsunschärfe: Das Plugin verfolgt jeden Pixel
 vom vorherigen zum nächsten Frame (optischer Fluss) und verwischt das Bild entlang

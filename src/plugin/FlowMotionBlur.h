@@ -8,12 +8,12 @@
 #define FMB_DESCRIPTION   "Vektorbasierte Bewegungsunschaerfe per optischem Fluss."
 
 #define FMB_MAJOR_VERSION 1
-#define FMB_MINOR_VERSION 7
+#define FMB_MINOR_VERSION 8
 #define FMB_BUG_VERSION   0
 #define FMB_STAGE_VERSION PF_Stage_DEVELOP
 #define FMB_BUILD_VERSION 1
 // Muss zu AE_Effect_Version in FlowMotionBlurPiPL.r passen:
-// PF_VERSION(1,7,0,PF_Stage_DEVELOP,1) = (1<<19)|(7<<15)|1 = 753665
+// PF_VERSION(1,8,0,PF_Stage_DEVELOP,1) = (1<<19)|(8<<15)|1 = 786433
 
 #define FMB_NUM_TRACK_POINTS 6
 

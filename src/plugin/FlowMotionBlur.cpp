@@ -664,6 +664,36 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         if (step == 0) { step = std::max<A_long>(1, static_cast<A_long>(in_data->time_scale / 25)); stepSrc = "ERSATZ 1/25 S"; }
         if (step < 0) step = -step;
 
+        // Clip-Geschwindigkeit (Premiere): Liegt der Effekt auf einem Clip mit
+        // konstantem Tempo (z. B. 500 %), rechnet Premiere das Tempo erst nach dem
+        // Effekt ein. Die Nachbarbilder liegen dann um 'Tempo' Bilder auseinander.
+        double clipSpeed = 1.0;
+        if (IsPremiere(in_data)) {
+            Suite<PF_UtilitySuite> us(in_data, kPFUtilitySuite, kPFUtilitySuiteVersion2);
+            if (us && us->GetClipSpeed) {
+                double sp = 1.0;
+                if (us->GetClipSpeed(in_data->effect_ref, &sp) == PF_Err_NONE && std::isfinite(sp) &&
+                    std::fabs(sp) > 0.01 && std::fabs(sp) < 100.0)
+                    clipSpeed = sp;
+            }
+        }
+        const A_long baseStep = step;
+        if (std::fabs(std::fabs(clipSpeed) - 1.0) > 0.01)
+            step = std::max<A_long>(1, static_cast<A_long>(std::llround(baseStep * std::fabs(clipSpeed))));
+        const int dirSign = clipSpeed < 0 ? -1 : 1; // rueckwaerts laufender Clip
+
+        // Selbsttest: Liefert ein Abruf zum aktuellen Zeitpunkt dasselbe Bild wie
+        // die Eingabe? Wenn nicht, rechnet Premiere in einer anderen Zeitbasis.
+        double selfDiff = -1.0;
+        {
+            fmb::Flow dummyFlow; fmb::Image selfLuma; NbInfo selfInfo; PF_Err e2 = PF_Err_NONE;
+            const std::vector<fmb::Guide> none;
+            if (NeighbourFlow(in_data, 0, cur, curLuma, factor, fp, alphaWeight, curAlpha, none, eng,
+                              dummyFlow, e2, selfInfo, false, selfLuma))
+                selfDiff = selfInfo.diff;
+            if (e2) return e2;
+        }
+
         const std::vector<fmb::Guide> gF = CollectGuides(in_data, params, +step, factor);
         const std::vector<fmb::Guide> gB = CollectGuides(in_data, params, -step, factor);
 
@@ -686,7 +716,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         bool haveF = false, haveB = false;
         for (int k = 1; k <= 4; ++k) {
             NbInfo tmp;
-            haveF = NeighbourFlow(in_data, +step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
+            haveF = NeighbourFlow(in_data, dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gFtrack, eng, fwd, err, tmp, !cameraMode, lumF);
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoF = tmp; kF = k;
@@ -694,7 +724,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         }
         for (int k = 1; k <= 4; ++k) {
             NbInfo tmp;
-            haveB = NeighbourFlow(in_data, -step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
+            haveB = NeighbourFlow(in_data, -dirSign * step * k, cur, curLuma, factor, fp, alphaWeight, curAlpha, gBtrack, eng, bwd, err, tmp, !cameraMode, lumB);
             if (err) return err;
             if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
             infoB = tmp; kB = k;
@@ -790,7 +820,9 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                         "  AUSGABE: " + std::to_string(output->width) + "X" + std::to_string(output->height));
             L.push_back("ZEIT: " + std::to_string(in_data->current_time) + "  SKALA: " + std::to_string(in_data->time_scale));
             L.push_back("TIME_STEP: " + std::to_string(in_data->time_step) + "  LOCAL: " + std::to_string(in_data->local_time_step));
-            L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")");
+            L.push_back("VERWENDET: " + std::to_string(step) + " (" + stepSrc + ")  CLIP-TEMPO " + Num(clipSpeed * 100, 0) + "%");
+            L.push_back("ABRUF JETZT = EINGABE? UNTERSCHIED " + (selfDiff < 0 ? std::string("-") : Num(selfDiff * 100, 2)) +
+                        (selfDiff > 0.01 ? "  -> ZEITBASIS ABWEICHEND" : ""));
             L.push_back("VORSCHAU 1/" + Num(DownsampleX(in_data), 0) + "  ANALYSE 1/" + std::to_string(factor));
             L.push_back("KAMERA: " + modelState);
             L.push_back("VORWAERTS: " + infoF.status + (kF > 1 ? "  (" + std::to_string(kF) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
