@@ -1,8 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 project(FlowMotionBlur CXX)
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Optional (nur Mac): Ordner mit den Premiere-GPU-Headern (PrSDKGPUFilter.h usw.,
+# z. B. "Examples" eines neueren After Effects SDK). Damit wird Premieres eigener
+# GPU-Weg (Metal) eingebaut.
+set(PR_GPU_SDK "" CACHE PATH "Pfad zum Examples-Ordner mit Headers/PrSDKGPUFilter.h")
 
 # Pfad zum "Examples"-Ordner des After Effects SDK, z. B.
 #   -DAE_SDK="C:/AfterEffectsSDK/Examples"
@@ -35,6 +43,17 @@ add_executable(fmb_test_occlusion tests/test_occlusion.cpp)
 target_link_libraries(fmb_test_occlusion PRIVATE fmb_core)
 add_executable(fmb_test_drone tests/test_drone.cpp)
 target_link_libraries(fmb_test_drone PRIVATE fmb_core)
+
+# Metal-Kerne fuer Premieres GPU-Weg (nur Mac) + Vergleichstest mit der CPU
+if(APPLE)
+  add_library(fmb_metal STATIC src/gpu/MetalBackend.mm)
+  target_link_libraries(fmb_metal PUBLIC fmb_core "-framework Metal" "-framework Foundation")
+  target_compile_options(fmb_metal PRIVATE -fobjc-arc -O3)
+  set_target_properties(fmb_metal PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  add_executable(fmb_test_metal tests/test_metal.mm)
+  target_link_libraries(fmb_test_metal PRIVATE fmb_metal)
+  target_compile_options(fmb_test_metal PRIVATE -fobjc-arc)
+endif()
 
 # Prueft die OpenCL-Deklarationen gegen die Khronos-Header (falls vorhanden)
 find_path(OPENCL_HEADER_DIR CL/cl.h)
@@ -93,4 +112,17 @@ elseif(APPLE)
     BUNDLE_EXTENSION "plugin"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/Info.plist.in")
   target_compile_options(FlowMotionBlur PRIVATE -Wno-multichar -O3 ${FMB_X86_OPT})
+
+  # Premieres GPU-Weg (Metal): eigene Objektdatei mit den Premiere-Headern
+  if(PR_GPU_SDK AND EXISTS "${PR_GPU_SDK}/Headers/PrSDKGPUFilter.h")
+    add_library(fmb_prgpu OBJECT src/plugin/PrGpuFilter.cpp)
+    target_include_directories(fmb_prgpu PRIVATE "${PR_GPU_SDK}/Headers" "${PR_GPU_SDK}/Headers/SP" src/core src/gpu)
+    target_compile_options(fmb_prgpu PRIVATE -Wno-multichar -O3 ${FMB_X86_OPT})
+    target_sources(FlowMotionBlur PRIVATE $<TARGET_OBJECTS:fmb_prgpu>)
+    target_link_libraries(FlowMotionBlur PRIVATE fmb_metal)
+    target_compile_definitions(FlowMotionBlur PRIVATE FMB_HAS_PR_GPU=1)
+    message(STATUS "Premiere-GPU-Weg (Metal) wird eingebaut.")
+  else()
+    message(STATUS "PR_GPU_SDK nicht gesetzt - ohne Premiere-GPU-Weg.")
+  endif()
 endif()

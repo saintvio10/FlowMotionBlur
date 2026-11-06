@@ -1,6 +1,6 @@
 # Flow Motion Blur – Plugin für Premiere Pro (und After Effects)
 
-**Version 2.0**
+**Version 2.1**
 
 Automatische, vektorbasierte Bewegungsunschärfe: Das Plugin verfolgt jeden Pixel
 vom vorherigen zum nächsten Frame (optischer Fluss) und verwischt das Bild entlang
@@ -33,6 +33,7 @@ dieser Bewegung. Einfach auf einen Clip ziehen – fertig.
 | **Vektor-Glättung** | Glättet das Bewegungsfeld; höher bei unruhigen Ergebnissen |
 | **RGB+A-Tracking** | Nutzt den Alphakanal für die Analyse mit |
 | **GPU verwenden** | Rechnet per OpenCL auf der Grafikkarte, sonst automatisch CPU |
+| **Premiere-GPU (Metal)** | Nur Mac: nutzt Premieres eigene GPU-Schnittstelle, die Bilder bleiben auf der Grafikkarte. Standardmäßig aus (siehe unten) |
 | **Ansicht** | „Bewegungsvektoren“ zeigt Richtung (Farbe) und Stärke (Helligkeit); „Diagnose“ schreibt Pixelformat, Zeitschritte, Status der Nachbarframes und des Kameramodells ins Bild |
 | **Vektor-Quelle** | „Automatisch (Tracking)“ oder „Vektor-Ebene“ |
 
@@ -75,6 +76,16 @@ sich nichts“.
 - Hinweis: Premiere zeigt den Effekt nicht mit dem „GPU-beschleunigt“-Symbol an, weil
   dieses nur für Effekte gilt, die Premieres eigene GPU-Schnittstelle nutzen. Die
   Berechnung läuft trotzdem auf der Grafikkarte.
+- **Premiere-GPU (Metal), nur Mac:** Ist die Option an, holt Premiere Bild und
+  Nachbarbilder direkt als Metal-Puffer. Die Unschärfe wird auf der Grafikkarte
+  in Premieres Bild gerechnet, die Bewegungsanalyse läuft weiter auf der CPU.
+  Das Kopieren der großen Bilder in den Arbeitsspeicher fällt weg. Premiere zeigt den
+  Effekt dann als GPU-beschleunigt an. Dieser Weg gilt nur für den häufigen Fall:
+  Ansicht „Ergebnis“, Modus „Natürlich“, Tracking und kein aktiver Track Point.
+  Sonst, und wenn Premiere nicht mit Metal rendert, rechnet automatisch der normale Weg.
+  Die Ansicht „Diagnose“ zeigt in der Zeile „PREMIERE-GPU“, ob der Weg aktiv war und
+  wie lange das letzte Bild gedauert hat. Nachbarbilder holt dieser Weg nur ±1 und ±2
+  Bilder weit. Doppelte Bilder werden dadurch bis zu einer Wiederholung von 2 erkannt.
 - Zur Fehlersuche: Umgebungsvariable `FMB_GPU_DEBUG=1` gibt OpenCL-Fehler aus,
   `FMB_DISABLE_GPU=1` schaltet die GPU global ab.
 
@@ -134,6 +145,8 @@ src/core/FlowCore.*              Optischer Fluss, Track Points, Bewegungsunschä
 src/gpu/GpuBackend.*             Dieselben Schritte per OpenCL
 src/gpu/Kernels.h                OpenCL-Kernel (zur Laufzeit kompiliert)
 src/gpu/ClApi.h                  OpenCL-Funktionen, dynamisch geladen
+src/gpu/MetalBackend.*           Metal-Kerne für Premieres GPU-Weg (Mac)
+src/plugin/PrGpuFilter.cpp       Anbindung an Premieres GPU-Schnittstelle (Mac)
 src/plugin/FlowMotionBlur.*      Anbindung an Premiere/After Effects
 src/plugin/FlowMotionBlurPiPL.r  Plugin-Beschreibung für den Host
 tests/                           Tests (Kern, GPU-Vergleich, OpenCL-Deklarationen)

@@ -8,12 +8,12 @@
 #define FMB_DESCRIPTION   "Vektorbasierte Bewegungsunschaerfe per optischem Fluss."
 
 #define FMB_MAJOR_VERSION 2
-#define FMB_MINOR_VERSION 0
+#define FMB_MINOR_VERSION 1
 #define FMB_BUG_VERSION   0
 #define FMB_STAGE_VERSION PF_Stage_DEVELOP
 #define FMB_BUILD_VERSION 1
 // Muss zu AE_Effect_Version in FlowMotionBlurPiPL.r passen:
-// PF_VERSION(2,0,0,PF_Stage_DEVELOP,1) = (2<<19)|1 = 1048577
+// PF_VERSION(2,1,0,PF_Stage_DEVELOP,1) = (2<<19)|(1<<15)|1 = 1081345
 
 #define FMB_NUM_TRACK_POINTS 6
 
@@ -29,6 +29,7 @@ enum {
     FMB_SMOOTHING,       // Glaettung der Vektoren
     FMB_RGBA_TRACKING,   // Alphakanal fuer die Analyse mitverwenden
     FMB_USE_GPU,         // OpenCL verwenden, falls vorhanden
+    FMB_PR_GPU,          // Premieres GPU-Weg (Metal, nur Mac)
     FMB_VIEW,            // Ergebnis oder Vektoren anzeigen
     FMB_VECTOR_SOURCE,   // Automatisch (Tracking) oder Vektor-Ebene
 
@@ -72,6 +73,7 @@ enum {
     BLUR_MODE_DISK_ID,
     MOTION_TYPE_DISK_ID,
     MIN_MOTION_DISK_ID,
+    PR_GPU_DISK_ID,
     TP_FIRST_DISK_ID = 100 // je Punkt i: 100 + 2i (aktiv), 101 + 2i (Position)
 };
 

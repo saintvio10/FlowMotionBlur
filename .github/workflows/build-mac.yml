@@ -22,12 +22,22 @@ jobs:
           git sparse-checkout set Legacy/Headers Legacy/Util Legacy/Resources
           git checkout db6dad3959522cfcd593dfe12a9fa4ad022d31e3
 
+      # Header fuer Premieres GPU-Schnittstelle (PrSDKGPUFilter.h usw.), feste Version
+      - name: Premiere-GPU-Header holen
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/yergin/after-effects-sdk.git prsdk
+          cd prsdk
+          git sparse-checkout set Examples/Headers
+          git checkout 27c89e72c695b1f5280dbbfc398c2fb85465aa02
+          ls Examples/Headers/PrSDKGPUFilter.h
+
       - name: Konfigurieren
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
           -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
           -DAE_SDK="$PWD/sdk/Legacy"
+          -DPR_GPU_SDK="$PWD/prsdk/Examples"
 
       - name: Bauen
         run: cmake --build build --config Release -j 3
@@ -35,13 +45,17 @@ jobs:
       - name: Kern- und GPU-Test (OpenCL des Macs)
         run: FMB_OPENCL_ALLOW_CPU=1 FMB_GPU_DEBUG=1 ./build/fmb_test build
 
+      - name: Metal-Test (GPU gegen CPU)
+        run: ./build/fmb_test_metal
+
       - name: Signieren (ad hoc) und pruefen
         run: |
           codesign --force --deep --sign - build/FlowMotionBlur.plugin
           codesign --verify --verbose build/FlowMotionBlur.plugin
           lipo -info build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur
           ls -la build/FlowMotionBlur.plugin/Contents build/FlowMotionBlur.plugin/Contents/Resources
-          nm -gU build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur | grep -E "EffectMain|PluginDataEntryFunction2"
+          nm -gU build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur | grep -E "EffectMain|PluginDataEntryFunction2|xGPUFilterEntry"
+          test "$(nm -gU build/FlowMotionBlur.plugin/Contents/MacOS/FlowMotionBlur | grep -c xGPUFilterEntry)" -ge 1
 
       - name: Paket schnueren
         run: |

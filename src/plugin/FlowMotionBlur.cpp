@@ -385,6 +385,9 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_ADD_CHECKBOXX("GPU verwenden", TRUE, 0, USE_GPU_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Premiere-GPU (Metal)", FALSE, 0, PR_GPU_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Ansicht", 3, VIEW_RESULT, "Ergebnis|Bewegungsvektoren|Diagnose", VIEW_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
@@ -1126,6 +1129,21 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("RUECKWAERTS: " + infoB.status + (kB > 1 ? "  (" + std::to_string(kB) + " BILDER WEITER, DOPPELTE BILDER)" : ""));
             L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  VORSUCHE " + Num(infoB.shift) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
             L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
+            {
+                // Statusdatei des Premiere-GPU-Wegs (PrGpuFilter.cpp)
+                std::ifstream gs(DiagDir().parent_path() / "premiere_gpu.txt");
+                std::string a, b;
+                if (gs && std::getline(gs, a) && std::getline(gs, b)) {
+                    L.push_back("PREMIERE-GPU " + a);
+                    L.push_back("  LETZTES GPU-" + b);
+                } else {
+#if defined(_WIN32)
+                    L.push_back("PREMIERE-GPU: NUR AUF DEM MAC");
+#else
+                    L.push_back(std::string("PREMIERE-GPU: ") + (params[FMB_PR_GPU]->u.bd.value ? "NOCH NICHT GESTARTET" : "AUS"));
+#endif
+                }
+            }
             L.push_back("NACHBARN UNTEREINANDER: " + Num(diffNP * 100, 2) + (neighboursWrong ? "  -> ZEITVERZERRUNG, CLIP VERSCHACHTELN" : ""));
             if (cameraMode) {
                 auto modelLines = [&](const char* name, bool have, float sx, float sy, const char* why,
