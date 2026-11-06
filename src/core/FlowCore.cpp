@@ -1196,8 +1196,9 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
     Flow mf, mb;
     double Hf[9], Hb[9];
     float fdx = 0, fdy = 0, bdx = 0, bdy = 0;
-    if (In && fwd) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignHomography(I0, *In, fdx, fdy, Hf, &ci.resF); }
-    if (Ip && bwd) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignHomography(I0, *Ip, bdx, bdy, Hb, &ci.resB); }
+    if (In && fwd) { EstimateGlobalShift(I0, *In, fdx, fdy); ci.modelF = AlignHomography(I0, *In, fdx, fdy, Hf, &ci.resF); ci.whyF = ci.modelF ? "OK" : "SCHAETZUNG GESCHEITERT"; }
+    if (Ip && bwd) { EstimateGlobalShift(I0, *Ip, bdx, bdy); ci.modelB = AlignHomography(I0, *Ip, bdx, bdy, Hb, &ci.resB); ci.whyB = ci.modelB ? "OK" : "SCHAETZUNG GESCHEITERT"; }
+    ci.shiftFx = fdx; ci.shiftFy = fdy; ci.shiftBx = bdx; ci.shiftBy = bdy;
     const double Hid[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
     const double zeroF = (In && fwd) ? HomographyCost(I0, *In, Hid) : 0;
     const double zeroB = (Ip && bwd) ? HomographyCost(I0, *Ip, Hid) : 0;
@@ -1216,8 +1217,11 @@ void CameraFlows(const Image& I0, const Image* In, const Image* Ip, const FlowPa
         }
     }
     // Modell nur verwenden, wenn es besser zu den Bildern passt als "keine Bewegung"
-    if (ci.modelF && HomographyCost(I0, *In, Hf) >= zeroF) ci.modelF = false;
-    if (ci.modelB && HomographyCost(I0, *Ip, Hb) >= zeroB) ci.modelB = false;
+    ci.zeroF = zeroF; ci.zeroB = zeroB;
+    if (ci.modelF) { ci.costF = HomographyCost(I0, *In, Hf); ci.whyF = "OK"; std::copy(Hf, Hf + 9, ci.Hf);
+                     if (ci.costF >= zeroF) { ci.modelF = false; ci.whyF = "SCHLECHTER ALS RUHE"; } }
+    if (ci.modelB) { ci.costB = HomographyCost(I0, *Ip, Hb); ci.whyB = "OK"; std::copy(Hb, Hb + 9, ci.Hb);
+                     if (ci.costB >= zeroB) { ci.modelB = false; ci.whyB = "SCHLECHTER ALS RUHE"; } }
     auto track = [&](const Image* In1, Flow* out, Flow& model, bool ok, const double* Hm, float dx, float dy) {
         if (!In1 || !out) return;
         FlowParams q = p;

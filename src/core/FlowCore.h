@@ -144,6 +144,11 @@ void SelectCandidates(const Image& I0, const Image* Inext, const Image* Iprev,
 struct CameraInfo {
     bool modelF = false, modelB = false;
     double resF = 0, resB = 0;
+    // Diagnose: Vorsuche, Kosten von Modell und "keine Bewegung", Grund bei Ablehnung
+    float shiftFx = 0, shiftFy = 0, shiftBx = 0, shiftBy = 0;
+    double costF = 0, costB = 0, zeroF = 0, zeroB = 0;
+    const char* whyF = "-"; const char* whyB = "-";
+    double Hf[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Hb[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
     SelectStats sel;
 };
 using FlowFn = std::function<void(const Image&, const Image&, const FlowParams&, Flow&)>;

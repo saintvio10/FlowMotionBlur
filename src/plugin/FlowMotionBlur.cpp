@@ -30,6 +30,9 @@
 #include <cstdio>
 #include <new>
 #include <string>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 // ---------------------------------------------------------------------------
 // Suite-Helfer (ohne Abhaengigkeit von den Util-Dateien des SDK)
@@ -477,6 +480,36 @@ static const char* KindName(PixKind k)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Diagnose-Export: Bilder und Werte so speichern, wie das Plugin sie erhaelt
+// ---------------------------------------------------------------------------
+static std::filesystem::path DiagDir()
+{
+#if defined(_WIN32)
+    const char* base = std::getenv("APPDATA");
+    return std::filesystem::path(base ? base : ".") / "FlowMotionBlur" / "Diagnose";
+#else
+    const char* home = std::getenv("HOME");
+    return std::filesystem::path(home ? home : ".") / "Library" / "Application Support" / "FlowMotionBlur" / "Diagnose";
+#endif
+}
+
+static bool WritePGM(const std::filesystem::path& p, const fmb::Image& im)
+{
+    std::ofstream f(p, std::ios::binary);
+    if (!f) return false;
+    f << "P5\n" << im.w << " " << im.h << "\n255\n";
+    std::vector<unsigned char> row(im.w);
+    for (int y = 0; y < im.h; ++y) {
+        for (int x = 0; x < im.w; ++x) {
+            float v = im.row(y)[x] * 255.f + 0.5f;
+            row[x] = static_cast<unsigned char>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        f.write(reinterpret_cast<const char*>(row.data()), row.size());
+    }
+    return static_cast<bool>(f);
+}
+
 // Bilineares Skalieren eines RGBA-Bildes (fuer Nachbarframes in anderer Groesse).
 static void ResizeRGBA(const fmb::RGBAImage& src, int w, int h, fmb::RGBAImage& dst)
 {
@@ -652,6 +685,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         if ((err = PF_ABORT(in_data)) != PF_Err_NONE) return err;
 
         std::string modelState = "AUS (FREI)";
+        fmb::CameraInfo camInfo;
         if (cameraMode && (haveF || haveB)) {
             // Kamerabewegung direkt aus den Bildern, feines Tracking ab diesem
             // Modell, Auswahl je Bildstelle (Modell / Tracking / keine Bewegung).
@@ -661,6 +695,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                                  eng.Flow(a, b, q, nullptr, o);
                              },
                              haveF ? &fwd : nullptr, haveB ? &bwd : nullptr, &ci);
+            camInfo = ci;
             const bool okAll = (!haveF || ci.modelF) && (!haveB || ci.modelB);
             modelState = std::string(okAll ? "OK" : "TEILWEISE") + "  MODELL " + Num(ci.sel.model * 100, 0) +
                          "% TRACKING " + Num(ci.sel.local * 100, 0) + "% RUHE " + Num(ci.sel.zero * 100, 0) + "%";
@@ -701,6 +736,35 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             L.push_back("RUECKWAERTS: " + infoB.status);
             L.push_back("  UNTERSCHIED " + Num(infoB.diff * 100, 2) + "  VORSUCHE " + Num(infoB.shift) + "  BEWEGUNG " + Num(infoB.motion) + " PX");
             L.push_back(std::string("GPU: ") + (eng.gpuUsed ? "JA" : (params[FMB_USE_GPU]->u.bd.value ? "NICHT VERFUEGBAR" : "AUS")));
+            if (cameraMode) {
+                auto modelLines = [&](const char* name, bool have, float sx, float sy, const char* why,
+                                      double cost, double zero, const double* Hm) {
+                    if (!have) { L.push_back(std::string(name) + ": KEIN NACHBARBILD"); return; }
+                    L.push_back(std::string(name) + ": VORSUCHE " + Num(sx * factor, 0) + "," + Num(sy * factor, 0) +
+                                "  MODELL " + why);
+                    L.push_back("  KOSTEN " + Num(cost * 1000, 2) + "  RUHE " + Num(zero * 1000, 2) +
+                                "  SKAL " + Num(Hm[0] * Hm[4] - Hm[1] * Hm[3], 3) +
+                                "  T " + Num(Hm[2], 3) + "," + Num(Hm[5], 3) + "  P " + Num(Hm[6], 3) + "," + Num(Hm[7], 3));
+                };
+                modelLines("MODELL VOR", haveF, camInfo.shiftFx, camInfo.shiftFy, camInfo.whyF, camInfo.costF, camInfo.zeroF, camInfo.Hf);
+                modelLines("MODELL RUECK", haveB, camInfo.shiftBx, camInfo.shiftBy, camInfo.whyB, camInfo.costB, camInfo.zeroB, camInfo.Hb);
+            }
+            // Bilder + Werte speichern (fuer die Fehlersuche)
+            std::string exportState = "FEHLGESCHLAGEN";
+            try {
+                const std::filesystem::path dir = DiagDir();
+                std::filesystem::create_directories(dir);
+                bool ok = WritePGM(dir / "aktuell.pgm", curLuma);
+                if (haveF) ok = WritePGM(dir / "naechstes.pgm", lumF) && ok;
+                if (haveB) ok = WritePGM(dir / "vorheriges.pgm", lumB) && ok;
+                std::ofstream info(dir / "info.txt");
+                for (const auto& l : L) info << l << "\n";
+                info << "current_time=" << in_data->current_time << " time_step=" << in_data->time_step
+                     << " local_time_step=" << in_data->local_time_step << " time_scale=" << in_data->time_scale
+                     << " factor=" << factor << " haveF=" << haveF << " haveB=" << haveB << "\n";
+                if (ok && info) exportState = "GESPEICHERT";
+            } catch (...) {}
+            L.push_back("EXPORT: " + exportState);
             diag::DrawLines(result, L);
         }
         WriteWorld(result, outKind, output, IsPremiere(in_data));
